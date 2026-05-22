@@ -115,15 +115,18 @@ sudo chmod 700 /etc/kitsu-push-bridge
 Now, **from your own computer** (not on the server), open a second terminal window and run:
 
 ```bash
-scp /path/to/AuthKey_XXXXXXXXXX.p8 youruser@your-server-ip:/etc/kitsu-push-bridge/
+scp /path/to/AuthKey_XXXXXXXXXX.p8 youruser@your-server-ip:~/
 ```
 
-Replace `/path/to/AuthKey_XXXXXXXXXX.p8` with the actual location of the file on your computer, and `youruser@your-server-ip` with your server login details.
+Replace `/path/to/AuthKey_XXXXXXXXXX.p8` with the actual location of the file on your computer (e.g. `~/Downloads/AuthKey_AB12CD34EF.p8`), and `youruser@your-server-ip` with your server login details.
 
-Back on the server, lock down the file so only the system can read it:
+> Uploading directly to `/etc/kitsu-push-bridge/` will fail with "Permission denied" because that folder is owned by root. Uploading to `~/` (your home folder) works fine — we move it in the next step.
+
+Back on the server, move the key into place and lock it down:
 
 ```bash
-sudo chmod 600 /etc/kitsu-push-bridge/*.p8
+sudo mv ~/AuthKey_XXXXXXXXXX.p8 /etc/kitsu-push-bridge/
+sudo chmod 600 /etc/kitsu-push-bridge/AuthKey_XXXXXXXXXX.p8
 ```
 
 ---
