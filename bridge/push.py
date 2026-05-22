@@ -21,7 +21,7 @@ _DEAD_TOKEN_ERRORS = {
 class PushSender:
     def __init__(self, config: Config):
         self._apns = APNs(
-            key=config.apns_key_path,
+            key=open(config.apns_key_path).read(),
             key_id=config.apns_key_id,
             team_id=config.apns_team_id,
             topic=config.apns_bundle_id,
