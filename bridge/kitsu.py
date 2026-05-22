@@ -123,6 +123,10 @@ class KitsuClient:
         async def connect_error(data):
             logger.error("Socket.IO connect error (%s): %s", NS, data)
 
+        @sio.on("*", namespace=NS)
+        async def on_any(event, data):
+            logger.info("Socket.IO event received: %s  data=%s", event, str(data)[:200])
+
         @sio.on("comment:new", namespace=NS)
         async def on_comment_new(data):
             asyncio.create_task(self._handle_comment_new(data))
