@@ -282,7 +282,12 @@ In the iOS app login screen, enter the Push Bridge URL as:
 https://kitsu.mystudio.com/push-bridge
 ```
 
-> If your Kitsu is not yet behind HTTPS, see the [Certbot / Let's Encrypt guide](https://certbot.eff.org/instructions?ws=nginx&os=ubuntufocal) to add a free SSL certificate. The iOS app requires HTTPS.
+> **HTTP vs HTTPS:** iOS blocks plain HTTP calls to internet/public addresses (Apple's App Transport Security rules). However, HTTP works fine when the bridge is on your local studio network or accessed over a VPN — iOS allows HTTP to private IP ranges without any special configuration.
+> - Studio LAN / same Wi-Fi as Kitsu: `http://192.168.1.50:9090` works ✅
+> - Accessed over a VPN back to the studio: HTTP works ✅  
+> - Exposed on a public internet domain: HTTPS required ❌
+>
+> If you do need HTTPS, see the [Certbot / Let's Encrypt guide](https://certbot.eff.org/instructions?ws=nginx&os=ubuntufocal) for a free SSL certificate.
 
 ---
 
