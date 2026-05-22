@@ -125,15 +125,19 @@ class KitsuClient:
 
         @sio.on("*", namespace=NS)
         async def on_any(event, data):
-            logger.info("Socket.IO event received: %s  data=%s", event, str(data)[:200])
+            logger.debug("Socket.IO event: %s  data=%s", event, str(data)[:200])
+
+        @sio.on("notification:new", namespace=NS)
+        async def on_notification_new(data):
+            asyncio.create_task(self._handle_notification_new(data))
 
         @sio.on("comment:new", namespace=NS)
         async def on_comment_new(data):
             asyncio.create_task(self._handle_comment_new(data))
 
-        @sio.on("task:status-changed", namespace=NS)
-        async def on_status_changed(data):
-            asyncio.create_task(self._handle_status_changed(data))
+        @sio.on("task:update", namespace=NS)
+        async def on_task_update(data):
+            asyncio.create_task(self._handle_task_update(data))
 
         @sio.on("task:to-review", namespace=NS)
         async def on_to_review(data):
@@ -182,38 +186,78 @@ class KitsuClient:
             exclude_user_id=commenter_id,
         )
 
-    async def _handle_status_changed(self, data: Dict) -> None:
-        task_id = data.get("task_id")
-        if not task_id:
+    async def _handle_notification_new(self, data: Dict) -> None:
+        """
+        Kitsu fires notification:new with person_id already set — the server has
+        already decided who should be notified.  We just look up their APNs token
+        and push.  Fetch notification details to build a meaningful message.
+        """
+        person_id = data.get("person_id")
+        notification_id = data.get("notification_id")
+        project_id = data.get("project_id", "")
+        if not person_id:
             return
 
-        new_status_id = data.get("new_task_status_id")
-        changed_by = data.get("person_id")
-
-        task = await self._get_task(task_id)
-        if not task:
+        tokens = await self.store.get_tokens_for_user(person_id)
+        if not tokens:
             return
 
-        assignees: List[str] = task.get("assignees", [])
-        task_name = task.get("name") or "a task"
-        entity_name = task.get("entity_name") or ""
-        display_name = f"{entity_name} / {task_name}" if entity_name else task_name
+        # Try to build a richer message from the notification record
+        title = "📬 New notification"
+        body = "You have new activity in Kitsu."
+        task_id = ""
 
-        status_name = data.get("task_status_name", "")
-        if not status_name and new_status_id:
-            status = await self._get_task_status(new_status_id)
-            if status:
-                status_name = status.get("short_name") or status.get("name") or ""
+        if notification_id:
+            notif = await self._api_get(f"/data/notifications/{notification_id}")
+            if notif:
+                ntype = notif.get("notification_type") or notif.get("type") or ""
+                task_id = notif.get("task_id") or ""
+                author_id = notif.get("author_id") or notif.get("created_by") or ""
 
-        body = f"Status → {status_name}" if status_name else "Task status changed."
+                author_name = ""
+                if author_id:
+                    person = await self._get_person(author_id)
+                    if person:
+                        author_name = person.get("full_name") or person.get("name") or ""
 
-        await self._notify_users(
-            assignees,
-            title=f"🔄 {display_name}",
+                if task_id:
+                    task = await self._get_task(task_id)
+                    if task:
+                        task_name = task.get("name") or "a task"
+                        entity_name = task.get("entity_name") or ""
+                        display_name = f"{entity_name} / {task_name}" if entity_name else task_name
+
+                        if ntype == "comment":
+                            title = f"💬 {author_name}: {display_name}" if author_name else f"New comment on {display_name}"
+                            body = "A new comment was posted."
+                        elif ntype == "mention":
+                            title = f"🔔 {author_name} mentioned you" if author_name else "You were mentioned"
+                            body = display_name
+                        elif ntype == "assignation":
+                            title = f"📋 Assigned: {display_name}"
+                            body = "You have been assigned to this task."
+                        else:
+                            title = f"🔄 {display_name}"
+                            body = "Task updated."
+
+        logger.info("Notifying user %s via notification:new: %s", person_id, title)
+        await self.pusher.send(
+            tokens=tokens,
+            title=title,
             body=body,
-            data={"type": "task:status-changed", "task_id": task_id, "project_id": task.get("project_id", "")},
-            exclude_user_id=changed_by,
+            data={"type": "notification:new", "task_id": task_id, "project_id": project_id},
         )
+
+    async def _handle_task_update(self, data: Dict) -> None:
+        """
+        task:update fires for many internal changes; only act when the task
+        has a task_status_id change we can surface.  Skip if notification:new
+        already fired (Kitsu sends both for status changes visible to assignees).
+        """
+        # task:update carries only task_id + project_id — nothing to personalise,
+        # and notification:new already handles the targeted push.  No-op here
+        # so we don't double-notify.
+        pass
 
     async def _handle_to_review(self, data: Dict) -> None:
         task_id = data.get("task_id")
