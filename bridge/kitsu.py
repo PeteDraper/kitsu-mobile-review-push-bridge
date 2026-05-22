@@ -109,35 +109,37 @@ class KitsuClient:
     def _register_handlers(self) -> None:
         sio = self._sio
 
-        @sio.event
+        NS = "/events"
+
+        @sio.event(namespace=NS)
         async def connect():
-            logger.info("Socket.IO connected to Kitsu")
+            logger.info("Socket.IO connected to Kitsu (%s)", NS)
 
-        @sio.event
+        @sio.event(namespace=NS)
         async def disconnect():
-            logger.warning("Socket.IO disconnected from Kitsu")
+            logger.warning("Socket.IO disconnected from Kitsu (%s)", NS)
 
-        @sio.event
+        @sio.event(namespace=NS)
         async def connect_error(data):
-            logger.error("Socket.IO connect error: %s", data)
+            logger.error("Socket.IO connect error (%s): %s", NS, data)
 
-        @sio.on("comment:new")
+        @sio.on("comment:new", namespace=NS)
         async def on_comment_new(data):
             asyncio.create_task(self._handle_comment_new(data))
 
-        @sio.on("task:status-changed")
+        @sio.on("task:status-changed", namespace=NS)
         async def on_status_changed(data):
             asyncio.create_task(self._handle_status_changed(data))
 
-        @sio.on("task:to-review")
+        @sio.on("task:to-review", namespace=NS)
         async def on_to_review(data):
             asyncio.create_task(self._handle_to_review(data))
 
-        @sio.on("task:assign")
+        @sio.on("task:assign", namespace=NS)
         async def on_assign(data):
             asyncio.create_task(self._handle_assign(data))
 
-        @sio.on("preview-file:new")
+        @sio.on("preview-file:new", namespace=NS)
         async def on_preview_new(data):
             asyncio.create_task(self._handle_preview_new(data))
 
@@ -285,6 +287,7 @@ class KitsuClient:
                     socketio_path="/socket.io",
                     headers={"Authorization": f"Bearer {self._token}"},
                     transports=["websocket"],
+                    namespaces=["/events"],
                 )
                 await self._sio.wait()
             except socketio.exceptions.ConnectionError as e:
