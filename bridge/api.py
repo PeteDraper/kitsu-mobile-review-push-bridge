@@ -36,7 +36,7 @@ def create_app(config: Config, store: TokenStore) -> FastAPI:
     app = FastAPI(title="Kitsu Push Bridge", version="1.0.0", docs_url=None, redoc_url=None)
 
     async def _verify_kitsu_token(kitsu_token: str, expected_user_id: str) -> bool:
-        url = f"{config.kitsu_api_url}/auth/authenticated-user"
+        url = f"{config.kitsu_api_url}/auth/authenticated"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -47,7 +47,9 @@ def create_app(config: Config, store: TokenStore) -> FastAPI:
                     if resp.status != 200:
                         return False
                     data = await resp.json()
-                    actual_id = data.get("id") or data.get("user_id")
+                    # Zou returns either {"user": {"id": ...}} or {"id": ...} directly
+                    user = data.get("user") or data
+                    actual_id = user.get("id") or user.get("user_id")
                     return actual_id == expected_user_id
         except Exception as e:
             logger.warning("Kitsu token verification error: %s", e)
