@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -16,10 +16,32 @@ logger = logging.getLogger(__name__)
 RECONNECT_DELAY = 10
 # JWT is valid for 12 h in Kitsu; refresh 30 min before expiry
 TOKEN_REFRESH_INTERVAL = 11 * 60 * 60
-# Suppress duplicate pushes for the same (person, task) within this window.
-# Kitsu fires both a "mention" and a "comment" notification:new for the same
-# comment, arriving within milliseconds of each other.
-DEDUP_WINDOW_SECS = 4.0
+# How long to hold a pending send while collecting duplicate events.
+# Kitsu fires both "mention" and "comment" notification:new for the same
+# comment, arriving within milliseconds.  We wait this long then send the
+# highest-priority subtitle seen.
+DEDUP_DELAY_SECS = 0.5
+
+# Higher number = wins when competing with lower-priority type for same task.
+_TYPE_PRIORITY: Dict[str, int] = {
+    "mention":       6,
+    "reply-mention": 5,
+    "reply":         4,
+    "assignation":   3,
+    "playlist-ready":2,
+    "comment":       1,
+}
+
+
+@dataclass
+class _PendingSend:
+    """Holds the best candidate notification while waiting for duplicates."""
+    tokens: List[str]
+    body: str
+    payload_data: Dict[str, Any]
+    best_subtitle: str
+    best_priority: int
+    flush_task: "asyncio.Task[None]"
 
 
 class KitsuClient:
@@ -28,12 +50,15 @@ class KitsuClient:
         self.store = store
         self.pusher = pusher
         self._token: Optional[str] = None
-        # Bridge service-account person_id — cached at login so it can be
-        # suppressed from appearing as an author name in notifications.
+        # Bridge service-account person_id — cached at login so we can
+        # suppress it from appearing as an author name in notifications.
         self._bridge_person_id: Optional[str] = None
         self._sio = socketio.AsyncClient(reconnection=False, logger=False)
-        # Dedup table: (person_id, task_id) → monotonic send-time
-        self._recent_pushes: Dict[Tuple[str, str], float] = {}
+        # Pending-send table: (person_id, task_id) → _PendingSend
+        # Notifications are held for DEDUP_DELAY_SECS so that the
+        # higher-priority type wins when Kitsu fires both "mention" and
+        # "comment" for the same action.
+        self._pending: Dict[Tuple[str, str], _PendingSend] = {}
         self._register_handlers()
 
     # ── Authentication ─────────────────────────────────────────────────────────
@@ -249,25 +274,69 @@ class KitsuClient:
             return f"{name} commented" if name else "New comment"
         return f"{name} commented" if name else "New comment"
 
-    # ── Deduplication ──────────────────────────────────────────────────────────
+    # ── Priority-based dedup send ──────────────────────────────────────────────
 
-    def _is_duplicate(self, person_id: str, task_id: str) -> bool:
+    async def _flush_pending(self, key: Tuple[str, str]) -> None:
+        """Timer coroutine: wait, then send whatever the best candidate is."""
+        await asyncio.sleep(DEDUP_DELAY_SECS)
+        pending = self._pending.pop(key, None)
+        if not pending:
+            return
+        person_id, task_id = key
+        logger.info(
+            "notification sent → person=%s  subtitle=%r  body=%r  task_id=%s",
+            person_id, pending.best_subtitle, pending.body, task_id,
+        )
+        await self._notify(pending.tokens, pending.best_subtitle, pending.body, pending.payload_data)
+
+    def _queue_send(
+        self,
+        person_id: str,
+        task_id: str,
+        tokens: List[str],
+        subtitle: str,
+        ntype: str,
+        body: str,
+        payload_data: Dict[str, Any],
+    ) -> None:
         """
-        Return True if we already sent a push for (person_id, task_id) within
-        DEDUP_WINDOW_SECS.  Kitsu fires both a "mention" and a "comment"
-        notification:new for the same comment — the second must be dropped.
+        Queue a notification for (person_id, task_id).
+
+        If a higher-priority candidate already exists for this pair within the
+        dedup window, the subtitle is upgraded but the timer is not reset.
+        If this is a higher-priority type than the current candidate, replace
+        the subtitle.  The body and payload (task breadcrumb, task_id) are
+        taken from the first arrival since they are identical for all
+        notification types on the same task.
         """
+        priority = _TYPE_PRIORITY.get(ntype, 0)
         key = (person_id, task_id)
-        now = time.monotonic()
-        last = self._recent_pushes.get(key, 0.0)
-        if now - last < DEDUP_WINDOW_SECS:
-            return True
-        self._recent_pushes[key] = now
-        # Prune stale entries to keep memory bounded
-        if len(self._recent_pushes) > 2000:
-            cutoff = now - DEDUP_WINDOW_SECS
-            self._recent_pushes = {k: v for k, v in self._recent_pushes.items() if v > cutoff}
-        return False
+        existing = self._pending.get(key)
+        if existing:
+            if priority > existing.best_priority:
+                logger.debug(
+                    "dedup: upgrading subtitle %r→%r for person=%s task=%s",
+                    existing.best_subtitle, subtitle, person_id, task_id,
+                )
+                existing.best_subtitle = subtitle
+                existing.best_priority = priority
+            else:
+                logger.debug(
+                    "dedup: suppressing lower-priority type=%s for person=%s task=%s",
+                    ntype, person_id, task_id,
+                )
+            return
+
+        # First arrival — schedule a flush
+        flush_task = asyncio.create_task(self._flush_pending(key))
+        self._pending[key] = _PendingSend(
+            tokens=tokens,
+            body=body,
+            payload_data=payload_data,
+            best_subtitle=subtitle,
+            best_priority=priority,
+            flush_task=flush_task,
+        )
 
     # ── Notification dispatch ──────────────────────────────────────────────────
 
@@ -375,18 +444,6 @@ class KitsuClient:
             notification_id, ntype, task_id, author_id,
         )
 
-        # ── Deduplication: drop Kitsu's mention+comment duplicate pair ─────────
-        # When a comment mentions someone, Kitsu fires notification:new twice
-        # for the same person+task (types "mention" and "comment").  The first
-        # to arrive wins; the second is suppressed.
-        dedup_key_id = task_id or notification_id
-        if self._is_duplicate(person_id, dedup_key_id):
-            logger.info(
-                "notification:new — dedup suppressed (person=%s task=%s type=%s)",
-                person_id, task_id, ntype,
-            )
-            return
-
         # ── Fetch author + task info concurrently ──────────────────────────────
         person_result, task_info = await asyncio.gather(
             self._get_person(author_id) if author_id else asyncio.sleep(0),
@@ -427,7 +484,7 @@ class KitsuClient:
                 is_publish = bool(comment.get("preview_file_id") or comment.get("previews"))
 
         if ntype == "playlist-ready" and playlist_id:
-            playlist     = await self._get_playlist(playlist_id)
+            playlist      = await self._get_playlist(playlist_id)
             playlist_name = (playlist or {}).get("name") or "Playlist"
             subtitle      = f"{playlist_name} is ready"
             if not body:
@@ -435,14 +492,24 @@ class KitsuClient:
         else:
             subtitle = self._build_subtitle(ntype, author_id, author_name, is_publish)
 
-        logger.info(
-            "notification:new → person=%s  type=%s  subtitle=%r  body=%r  task_id=%s",
+        logger.debug(
+            "notification:new queued → person=%s  type=%s  subtitle=%r  body=%r  task_id=%s",
             person_id, ntype, subtitle, body, task_id,
         )
 
-        await self._notify(
-            tokens, subtitle, body,
-            {
+        # ── Priority dedup + delayed send ──────────────────────────────────────
+        # Kitsu fires "mention" and "comment" notification:new within ms of
+        # each other for the same action.  _queue_send holds the send for
+        # DEDUP_DELAY_SECS, upgrading the subtitle if a higher-priority type
+        # arrives in the window, then sends exactly one notification.
+        self._queue_send(
+            person_id=person_id,
+            task_id=task_id or notification_id,
+            tokens=tokens,
+            subtitle=subtitle,
+            ntype=ntype,
+            body=body,
+            payload_data={
                 "type":            "notification:new",
                 "task_id":         task_id,
                 "project_id":      (task_info or {}).get("project_id") or "",

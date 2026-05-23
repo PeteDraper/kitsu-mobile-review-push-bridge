@@ -57,13 +57,18 @@ class PushSender:
         alert: Dict[str, Any] = {"title": title, "body": body}
         if subtitle:
             alert["subtitle"] = subtitle
+        # expo-notifications reads request.content.data from userInfo["body"].
+        # Putting custom keys at the top level (payload.update(data)) leaves
+        # data=null on the JS side.  Wrapping under "body" is how Expo's own
+        # push service encodes custom payloads and is what the native SDK
+        # looks for first in its serialisation path.
         payload: Dict[str, Any] = {
             "aps": {
                 "alert": alert,
                 "sound": sound,
             },
+            "body": data,
         }
-        payload.update(data)
 
         request = NotificationRequest(
             device_token=device_token,
