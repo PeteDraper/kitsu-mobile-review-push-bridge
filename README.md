@@ -5,7 +5,7 @@ A lightweight service that connects your [Kitsu](https://www.cg-wire.com/en/kits
 > **Requirements**
 > - A Kitsu / Zou server running on Linux
 > - The bridge must be installed on the same server as your Kitsu instance
-> - [Kitsu Mobile Review](https://apps.apple.com/app/kitsu-mobile-review) installed from the App Store
+> - [Kitsu Mobile Review] installed from the App Store (in Beta...)
 
 ---
 
