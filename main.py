@@ -3,23 +3,17 @@
 Kitsu Push Bridge
 -----------------
 Connects to a Kitsu/Zou server via Socket.IO, listens for production events,
-and delivers push notifications directly to iOS devices via Apple APNs (HTTP/2).
+and forwards push notifications to the Kitsu Mobile Review relay for delivery
+to iOS devices.
 
 Setup:
     pip install -r requirements.txt
     cp .env.example .env && nano .env
     python3 main.py
-
-APNs key:
-    developer.apple.com → Certificates, Identifiers & Profiles
-    → Keys → (+) → Apple Push Notifications service (APNs)
-    Download the .p8 file once — it cannot be re-downloaded.
-    Note the Key ID. Your Team ID is shown top-right when signed in.
 """
 
 import asyncio
 import logging
-import os
 import signal
 import sys
 
@@ -56,16 +50,11 @@ async def main() -> None:
     setup_logging(config.log_level)
     logger = logging.getLogger("bridge.main")
 
-    if not os.path.isfile(config.apns_key_path):
-        logger.error("APNs key file not found: %s", config.apns_key_path)
-        sys.exit(1)
-
     store = TokenStore(config.db_path)
     await store.init()
 
     pusher = PushSender(config)
 
-    # Wire up dead-token cleanup — APNs tells us when a token is no longer valid
     async def _remove_dead_token(token: str) -> None:
         await store.delete_token(token)
 
@@ -83,9 +72,8 @@ async def main() -> None:
     server = uvicorn.Server(uv_config)
 
     logger.info(
-        "Kitsu Push Bridge starting  kitsu=%s  apns_bundle=%s  sandbox=%s  api=%s:%d",
+        "Kitsu Push Bridge starting  kitsu=%s  sandbox=%s  api=%s:%d",
         config.kitsu_url,
-        config.apns_bundle_id,
         config.apns_sandbox,
         config.bridge_host,
         config.bridge_port,
