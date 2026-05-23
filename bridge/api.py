@@ -56,14 +56,14 @@ def create_app(config: Config, store: TokenStore) -> FastAPI:
             return False
 
     @app.post("/push-tokens", status_code=204)
-    async def register_token(body: RegisterTokenRequest, request: Request) -> None:
+    async def register_token(body: RegisterTokenRequest) -> None:
         if not await _verify_kitsu_token(body.kitsu_token, body.kitsu_user_id):
             raise HTTPException(status_code=401, detail="Kitsu token verification failed")
         await store.upsert(body.kitsu_user_id, body.device_token)
         logger.info("Registered APNs token for user %s", body.kitsu_user_id)
 
     @app.delete("/push-tokens", status_code=204)
-    async def unregister_token(body: UnregisterTokenRequest, request: Request) -> None:
+    async def unregister_token(body: UnregisterTokenRequest) -> None:
         await store.delete_token(body.device_token)
         logger.info("Unregistered token …%s", body.device_token[-8:])
 
