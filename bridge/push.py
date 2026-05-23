@@ -10,8 +10,8 @@ logger = logging.getLogger(__name__)
 
 class PushSender:
     def __init__(self, config: Config):
-        self._relay_url    = config.relay_url
-        self._relay_secret = config.relay_secret
+        self._relay_url    = Config.RELAY_URL
+        self._relay_secret = Config.RELAY_SECRET
         self._sandbox      = config.apns_sandbox
         self.on_dead_token: Optional[Callable[[str], Coroutine]] = None
 
@@ -63,14 +63,12 @@ class PushSender:
                     if resp.status == 200:
                         logger.debug("Relay delivery OK for token …%s", device_token[-8:])
                     elif resp.status == 502:
-                        # Relay forwarded request but APNs rejected it — log detail
                         text = await resp.text()
                         logger.warning(
                             "APNs rejected token …%s: %s",
                             device_token[-8:],
                             text[:300],
                         )
-                        # Surface dead tokens: relay returns APNs status in JSON
                         try:
                             import json
                             detail = json.loads(text)
@@ -83,7 +81,7 @@ class PushSender:
                         except Exception:
                             pass
                     elif resp.status == 401:
-                        logger.error("Relay rejected request: invalid RELAY_SECRET")
+                        logger.error("Relay rejected request: authentication failed")
                     else:
                         text = await resp.text()
                         logger.warning(
