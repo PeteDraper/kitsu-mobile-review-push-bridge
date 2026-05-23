@@ -57,7 +57,7 @@ pip install -r requirements.txt
 ### Step 2 — Configure
 
 ```bash
-sudo nano /opt/kitsu-push-bridge/.env
+nano /opt/kitsu-push-bridge/.env
 ```
 
 ```env
