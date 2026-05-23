@@ -17,7 +17,6 @@ class Config:
     # Bridge API
     bridge_host: str
     bridge_port: int
-    bridge_secret: str
     # Storage
     db_path: str
     log_level: str
@@ -41,7 +40,6 @@ class Config:
             apns_sandbox=os.environ.get("APNS_SANDBOX", "false").strip().lower() == "true",
             bridge_host=os.environ.get("BRIDGE_HOST", "127.0.0.1"),
             bridge_port=int(os.environ.get("BRIDGE_PORT", "9090")),
-            bridge_secret=os.environ.get("BRIDGE_SECRET", ""),
             db_path=os.environ.get("DB_PATH", "./bridge_tokens.db"),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )

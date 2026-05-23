@@ -2,7 +2,7 @@ import logging
 import re
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
 
 from .config import Config
@@ -55,15 +55,8 @@ def create_app(config: Config, store: TokenStore) -> FastAPI:
             logger.warning("Kitsu token verification error: %s", e)
             return False
 
-    def _check_bridge_secret(request: Request) -> None:
-        if not config.bridge_secret:
-            return
-        if request.headers.get("X-Bridge-Secret", "") != config.bridge_secret:
-            raise HTTPException(status_code=403, detail="Invalid bridge secret")
-
     @app.post("/push-tokens", status_code=204)
     async def register_token(body: RegisterTokenRequest, request: Request) -> None:
-        _check_bridge_secret(request)
         if not await _verify_kitsu_token(body.kitsu_token, body.kitsu_user_id):
             raise HTTPException(status_code=401, detail="Kitsu token verification failed")
         await store.upsert(body.kitsu_user_id, body.device_token)
@@ -71,7 +64,6 @@ def create_app(config: Config, store: TokenStore) -> FastAPI:
 
     @app.delete("/push-tokens", status_code=204)
     async def unregister_token(body: UnregisterTokenRequest, request: Request) -> None:
-        _check_bridge_secret(request)
         await store.delete_token(body.device_token)
         logger.info("Unregistered token …%s", body.device_token[-8:])
 

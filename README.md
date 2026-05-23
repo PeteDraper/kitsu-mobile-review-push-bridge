@@ -6,6 +6,8 @@ It connects to your Kitsu server over Socket.IO, listens for events, and sends n
 
 Designed to pair with [Kitsu Mobile Review](https://github.com/PeteDraper/kitsu-mobile-review) (Expo/React Native iOS client).
 
+> **Requirement:** The bridge must be installed on the **same server** as your Kitsu/Zou instance and served by the same nginx. The iOS app always looks for the bridge at `{your-kitsu-host}/push-bridge/` automatically — no separate URL needed at login.
+
 ---
 
 ## How it works
@@ -56,17 +58,14 @@ Notifications mirror Kitsu's own notification page exactly — same wording, sam
 - Shot without episode: `Project / Sequence / Shot / Task Type`
 - Asset: `Project / Asset Type / Asset / Task Type`
 
-**Tapping a notification** opens the task review screen directly in the app. The `notification_id` is included in the payload so the app marks the notification read on open.
-
-**Secondary event handlers** (`comment:new`, `task:assign`, `task:to-review`, `preview-file:new`) use the same format as a fallback for any events that may not produce a `notification:new`.
+**Tapping a notification** opens the task review screen directly in the app. The `notification_id` is included in the payload so the app can mark the notification read on open.
 
 ---
 
 ## What you need before starting
 
-- An Ubuntu Linux server (18.04 or later) that can reach your Kitsu instance over the network. This can be the same machine Kitsu runs on, or a separate one.
+- The server your Kitsu/Zou instance already runs on (Ubuntu 18.04 or later).
 - An **Apple Developer account** (paid, $99/year) to create the APNs key.
-- Your Kitsu instance already running and accessible.
 
 > **Connecting via SSH from your Mac or Windows PC:**
 > Open Terminal (Mac) or PowerShell (Windows) and type:
@@ -88,7 +87,7 @@ This is a credential file (`.p8`) that proves to Apple you are allowed to send p
 
 ---
 
-## Step 2 — Install the bridge on your server
+## Step 2 — Install the bridge on your Kitsu server
 
 ```bash
 # Install Python if needed
@@ -139,7 +138,8 @@ sudo nano /opt/kitsu-push-bridge/.env
 Paste and fill in your values:
 
 ```env
-# Kitsu server — full URL with protocol and port, no trailing slash
+# Kitsu server — full URL with protocol, no trailing slash
+# Must be reachable from this server (localhost works if on the same machine)
 KITSU_URL=http://192.168.1.2
 
 # A Kitsu account with admin access used by the bridge as a service account
@@ -158,10 +158,6 @@ APNS_SANDBOX=true
 # Bridge HTTP server — listens on localhost, Nginx proxies externally
 BRIDGE_HOST=127.0.0.1
 BRIDGE_PORT=9090
-
-# Optional: require this secret header (X-Bridge-Secret) on all API requests
-# Set the same value in the iOS app settings if the bridge is internet-accessible
-BRIDGE_SECRET=
 
 # Token database location
 DB_PATH=/opt/kitsu-push-bridge/bridge_tokens.db
@@ -196,30 +192,26 @@ Press `Ctrl+C` to stop.
 
 ---
 
-## Step 6 — Set up Nginx proxy
+## Step 6 — Add the bridge to your existing Nginx config
 
-The bridge listens on `localhost:9090`. Nginx exposes it externally under a sub-path of your Kitsu domain.
+The bridge listens on `localhost:9090`. Add a `location` block to your **existing** Kitsu nginx config so the bridge is served under the same host.
 
 ```bash
-sudo nano /etc/nginx/sites-available/kitsu-push-bridge
+sudo nano /etc/nginx/sites-available/kitsu   # or wherever your Kitsu nginx config lives
 ```
 
-```nginx
-server {
-    listen 80;
-    server_name your-server-ip-or-domain;
+Add inside the `server {}` block that serves Kitsu:
 
-    location /push-bridge/ {
-        proxy_pass         http://127.0.0.1:9090/;
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-        proxy_read_timeout 30s;
-    }
+```nginx
+location /push-bridge/ {
+    proxy_pass         http://127.0.0.1:9090/;
+    proxy_set_header   Host $host;
+    proxy_set_header   X-Real-IP $remote_addr;
+    proxy_read_timeout 30s;
 }
 ```
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/kitsu-push-bridge /etc/nginx/sites-enabled/
 sudo nginx -t
 sudo systemctl reload nginx
 ```
@@ -294,7 +286,7 @@ sudo systemctl restart kitsu-push-bridge
 
 ## HTTP API reference
 
-The bridge exposes a minimal REST API used by the iOS app automatically.
+The bridge exposes a minimal REST API used by the iOS app automatically on login/logout.
 
 ### `POST /push-tokens` — Register a device
 
@@ -323,12 +315,6 @@ Returns `204 No Content`.
 
 Returns `{"status": "ok"}`.
 
-**Optional header on all requests** (when `BRIDGE_SECRET` is set):
-
-```
-X-Bridge-Secret: your-secret-value
-```
-
 ---
 
 ## APNs environment
@@ -342,8 +328,7 @@ A device token is environment-specific — a sandbox token will not work with pr
 
 ## Security notes
 
-- Every token registration is verified against the Kitsu API — a valid Kitsu JWT is required.
-- Set `BRIDGE_SECRET` to a strong random string if the bridge is internet-accessible, and configure the matching value in the iOS app.
+- Every token registration is verified against the Kitsu API — a valid Kitsu JWT is required. Only users with an active Kitsu session can register their device.
 - Keep your `.p8` key file and `.env` outside version control. Use `chmod 600` on both.
 - Use HTTPS (Nginx + Let's Encrypt) in production.
 - The token database (`bridge_tokens.db`) contains APNs device tokens — protect it with appropriate file permissions.
