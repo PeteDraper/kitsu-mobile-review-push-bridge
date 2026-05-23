@@ -95,28 +95,7 @@ Press `Ctrl+C` to stop.
 
 ---
 
-### Step 4 — Add to Nginx
-
-Add a `location` block to your existing Kitsu nginx config:
-
-```nginx
-location /push-bridge/ {
-    proxy_pass         http://0.0.0.0:9090/;
-    proxy_set_header   Host $host;
-    proxy_set_header   X-Real-IP $remote_addr;
-    proxy_read_timeout 30s;
-}
-```
-
-```bash
-sudo nginx -t && sudo systemctl reload nginx
-curl http://your-server-ip/push-bridge/health
-# → {"status": "ok"}
-```
-
----
-
-### Step 5 — Run as a service
+### Step 4 — Run as a service
 
 ```bash
 sudo nano /etc/systemd/system/kitsu-push-bridge.service
@@ -153,6 +132,27 @@ View live logs:
 
 ```bash
 sudo journalctl -u kitsu-push-bridge -f
+```
+
+---
+
+### Step 5 — Add to Nginx
+
+Add a `location` block to your existing Kitsu nginx config:
+
+```nginx
+location /push-bridge/ {
+    proxy_pass         http://0.0.0.0:9090/;
+    proxy_set_header   Host $host;
+    proxy_set_header   X-Real-IP $remote_addr;
+    proxy_read_timeout 30s;
+}
+```
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+curl http://your-server-ip/push-bridge/health
+# → {"status": "ok"}
 ```
 
 ---
