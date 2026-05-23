@@ -15,7 +15,7 @@ A lightweight service that connects your [Kitsu](https://www.cg-wire.com/en/kits
 Kitsu server  ──Socket.IO──▶  Push Bridge  ──HTTPS──▶  KMR Relay  ──APNs──▶  iOS device
 ```
 
-The bridge runs as a background service on your Kitsu server. It monitors Kitsu for activity and forwards notifications to the Kitsu Mobile Review relay, which handles Apple delivery. No Apple Developer account is needed.
+The bridge runs as a background service on your Kitsu server. It monitors Kitsu for activity and forwards notifications to the Kitsu Mobile Review relay, which handles Apple delivery.
 
 ---
 
