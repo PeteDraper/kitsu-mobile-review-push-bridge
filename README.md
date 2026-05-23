@@ -70,7 +70,7 @@ KITSU_PASSWORD=your-password
 ```
 
 ```bash
-sudo chmod 600 /opt/kitsu-push-bridge/.env
+chmod 600 /opt/kitsu-push-bridge/.env
 ```
 
 ---
