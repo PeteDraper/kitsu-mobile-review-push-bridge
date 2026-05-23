@@ -2,7 +2,7 @@
 
 A lightweight Python service that bridges [Kitsu](https://www.cg-wire.com/en/kitsu.html) production events to iOS push notifications via Apple APNs — **no Expo relay, no third-party push service, fully self-hosted**.
 
-It connects to your Kitsu server over Socket.IO, listens for task and comment events, and sends native iOS push notifications directly to registered devices using Apple's HTTP/2 APNs API.
+It connects to your Kitsu server over Socket.IO, listens for events, and sends native iOS push notifications directly to registered devices using Apple's HTTP/2 APNs API.
 
 Designed to pair with [Kitsu Mobile Review](https://github.com/PeteDraper/kitsu-mobile-review) (Expo/React Native iOS client).
 
@@ -18,24 +18,60 @@ Kitsu server  ──Socket.IO──▶  Push Bridge  ──APNs HTTP/2──▶ 
                               on login (HTTP POST)
 ```
 
-1. The bridge logs into Kitsu as a service account and maintains a persistent Socket.IO connection.
-2. When a relevant event fires (`comment:new`, `task:status-changed`, `task:to-review`, `task:assign`, `preview-file:new`), the bridge fetches the task details, resolves assigned users, and pushes notifications to their registered devices.
-3. The iOS app registers its raw APNs device token with the bridge after login and unregisters on logout.
-4. Dead tokens (app uninstalled, device reset) are removed automatically from the database when APNs returns `GONE` or `BadDeviceToken`.
+1. The bridge logs into Kitsu as a service account and maintains a persistent Socket.IO connection to the `/events` namespace.
+2. The primary trigger is `notification:new` — Kitsu fires this for each person who should be notified, so no recipient logic is needed in the bridge.
+3. The bridge fetches the notification record and task details, builds the message, and pushes to all APNs tokens registered for that person.
+4. The iOS app registers its raw APNs device token with the bridge after login and unregisters on logout.
+5. Dead tokens (app uninstalled, device reset) are removed automatically when APNs returns `GONE` or `BadDeviceToken`.
+
+---
+
+## Notification format
+
+Notifications mirror Kitsu's own notification page exactly — same wording, same breadcrumb structure.
+
+**APNs fields:**
+
+| Field | Content |
+|-------|---------|
+| **Title** | `Kitsu Mobile Review` (always — identifies the app) |
+| **Subtitle** | Event description (see table below) |
+| **Body** | `Project / Entity Path / Task Type` |
+
+**Subtitle strings by notification type:**
+
+| Kitsu type | Subtitle |
+|------------|---------|
+| Comment | `{Author} commented` |
+| Comment with revision (publish) | `{Author} published a preview` |
+| Mention in comment | `{Author} mentioned you` |
+| Reply to comment | `{Author} replied` |
+| Reply that mentions you | `{Author} mentioned you` |
+| Task assigned | `{Author} assigned you` |
+| Playlist ready | `{Playlist name} is ready` |
+
+**Body breadcrumb** (mirrors Zou's `names_service.get_full_entity_name`):
+
+- Shot with episode: `Project / Episode / Sequence / Shot / Task Type`
+- Shot without episode: `Project / Sequence / Shot / Task Type`
+- Asset: `Project / Asset Type / Asset / Task Type`
+
+**Tapping a notification** opens the task review screen directly in the app. The `notification_id` is included in the payload so the app marks the notification read on open.
+
+**Secondary event handlers** (`comment:new`, `task:assign`, `task:to-review`, `preview-file:new`) use the same format as a fallback for any events that may not produce a `notification:new`.
 
 ---
 
 ## What you need before starting
 
-- An Ubuntu Linux server (18.04 or later). This can be the same machine your Kitsu instance runs on, or a separate one. It needs to be able to reach your Kitsu server over the network.
-- A way to type commands on that server — either directly at the keyboard, or via SSH from your own computer (see the SSH tip below).
-- An **Apple Developer account** (paid, $99/year) — needed to create the APNs key that lets the bridge send notifications to iPhones.
+- An Ubuntu Linux server (18.04 or later) that can reach your Kitsu instance over the network. This can be the same machine Kitsu runs on, or a separate one.
+- An **Apple Developer account** (paid, $99/year) to create the APNs key.
 - Your Kitsu instance already running and accessible.
 
-> **Connecting via SSH from your Mac or Windows PC:**  
-> Open Terminal (Mac) or PowerShell (Windows) and type:  
-> `ssh youruser@your-server-ip`  
-> Press Enter, type your password when asked. You are now controlling your Ubuntu server remotely.
+> **Connecting via SSH from your Mac or Windows PC:**
+> Open Terminal (Mac) or PowerShell (Windows) and type:
+> `ssh youruser@your-server-ip`
+> Press Enter, type your password when asked. You are now controlling the server remotely.
 
 ---
 
@@ -43,165 +79,165 @@ Kitsu server  ──Socket.IO──▶  Push Bridge  ──APNs HTTP/2──▶ 
 
 This is a credential file (`.p8`) that proves to Apple you are allowed to send push notifications to your app. You only do this once.
 
-1. Go to [developer.apple.com](https://developer.apple.com) and sign in
-2. Click **Account** in the top menu, then go to **Certificates, Identifiers & Profiles**
-3. In the left sidebar click **Keys**
-4. Click the blue **+** button to create a new key
-5. Give it any name (e.g. `KitsuPushBridge`), tick **Apple Push Notifications service (APNs)**, then click **Continue** → **Register**
-6. Click **Download** — save this `.p8` file somewhere safe on your computer. **You can only download it once.**
-7. On the same page, note the **Key ID** — it's a 10-character code like `AB12CD34EF`
-8. Your **Team ID** is shown in the top-right corner of developer.apple.com when you are signed in — another 10-character code
-
-You will need the `.p8` file, the Key ID, and the Team ID in Step 4.
+1. Go to [developer.apple.com](https://developer.apple.com) and sign in.
+2. Go to **Account → Certificates, Identifiers & Profiles → Keys**.
+3. Click **+**, give it a name (e.g. `KitsuPushBridge`), tick **Apple Push Notifications service (APNs)**, then **Continue → Register**.
+4. Click **Download** — save the `.p8` file somewhere safe on your computer. **You can only download it once.**
+5. Note the **Key ID** — a 10-character code like `AB12CD34EF`.
+6. Your **Team ID** is shown in the top-right corner when signed into developer.apple.com — also a 10-character code.
 
 ---
 
 ## Step 2 — Install the bridge on your server
 
-Open a terminal on your Ubuntu server and run each of these commands one at a time. Lines starting with `#` are just explanations — you don't need to type those.
-
-### Check Python is installed
-
 ```bash
-python3 --version
-```
-
-You should see something like `Python 3.10.x` or higher. If you see `command not found`, install it:
-
-```bash
+# Install Python if needed
 sudo apt update
 sudo apt install -y python3 python3-pip python3-venv git
-```
 
-> `sudo` means "run this as administrator". Ubuntu will ask for your password the first time.
-
-### Download the bridge code
-
-```bash
-# Move to /opt — a standard place on Linux to install services
+# Download the bridge
 cd /opt
-
-# Download the code from GitHub
 sudo git clone https://github.com/PeteDraper/kitsu-mobile-review-push-bridge.git kitsu-push-bridge
+sudo chown -R $USER:$USER /opt/kitsu-push-bridge
 
-# Move into the folder
+# Create a Python virtual environment and install dependencies
 cd /opt/kitsu-push-bridge
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
-
-### Install Python dependencies into an isolated environment
-
-```bash
-# Create a self-contained Python environment just for this service
-sudo python3 -m venv .venv
-
-# Install the required Python packages into it
-sudo .venv/bin/pip install -r requirements.txt
-```
-
-This downloads and installs everything the bridge needs without affecting anything else on your server.
 
 ---
 
 ## Step 3 — Upload your APNs key
 
-You need to copy the `.p8` file from your computer to the server. A safe place to store it is `/etc/kitsu-push-bridge/`.
+Copy the `.p8` file you downloaded from Apple to a secure location on the server. From your local machine:
 
 ```bash
-# Create the directory for the key
+scp /path/to/AuthKey_XXXXXXXXXX.p8 youruser@your-server-ip:~
+```
+
+Then on the server:
+
+```bash
 sudo mkdir -p /etc/kitsu-push-bridge
-sudo chmod 700 /etc/kitsu-push-bridge
-```
-
-Now, **from your own computer** (not on the server), open a second terminal window and run:
-
-```bash
-scp /path/to/AuthKey_XXXXXXXXXX.p8 youruser@your-server-ip:~/
-```
-
-Replace `/path/to/AuthKey_XXXXXXXXXX.p8` with the actual location of the file on your computer (e.g. `~/Downloads/AuthKey_AB12CD34EF.p8`), and `youruser@your-server-ip` with your server login details.
-
-> Uploading directly to `/etc/kitsu-push-bridge/` will fail with "Permission denied" because that folder is owned by root. Uploading to `~/` (your home folder) works fine — we move it in the next step.
-
-Back on the server, move the key into place and lock it down:
-
-```bash
 sudo mv ~/AuthKey_XXXXXXXXXX.p8 /etc/kitsu-push-bridge/
 sudo chmod 600 /etc/kitsu-push-bridge/AuthKey_XXXXXXXXXX.p8
 ```
+
+> **Important:** The `.p8` file must end with a newline character. If APNs rejects your key, run:
+> `echo "" >> /etc/kitsu-push-bridge/AuthKey_XXXXXXXXXX.p8`
 
 ---
 
 ## Step 4 — Configure the bridge
 
-The bridge reads its settings from a file called `.env`. Copy the example file and fill it in:
-
 ```bash
-sudo cp /opt/kitsu-push-bridge/.env.example /opt/kitsu-push-bridge/.env
 sudo nano /opt/kitsu-push-bridge/.env
 ```
 
-> `nano` is a simple text editor built into Ubuntu. Use the arrow keys to move around. When you are done, press `Ctrl+X`, then `Y`, then `Enter` to save.
+Paste and fill in your values:
 
-Fill in each value:
+```env
+# Kitsu server — full URL with protocol and port, no trailing slash
+KITSU_URL=http://192.168.1.2
 
-| Setting | What to put |
-|---|---|
-| `KITSU_URL` | The URL of your Kitsu server, e.g. `http://192.168.1.50` or `https://kitsu.mystudio.com` — no trailing slash |
-| `KITSU_EMAIL` | Email address of a Kitsu admin account. Create a dedicated one called e.g. `push-bridge@mystudio.com` rather than using a person's login |
-| `KITSU_PASSWORD` | Password for that account |
-| `APNS_KEY_PATH` | `/etc/kitsu-push-bridge/AuthKey_XXXXXXXXXX.p8` — use the actual filename of your key |
-| `APNS_KEY_ID` | The 10-character Key ID you noted in Step 1 |
-| `APNS_TEAM_ID` | The 10-character Team ID from developer.apple.com |
-| `APNS_BUNDLE_ID` | The bundle ID of the iOS app, e.g. `com.mystudio.kitsu-client` |
-| `APNS_SANDBOX` | `true` if you are using a development/TestFlight build, `false` for App Store builds |
-| `BRIDGE_HOST` | Leave as `127.0.0.1` (the bridge will only be reachable locally, which is safer) |
-| `BRIDGE_PORT` | Leave as `9090` |
-| `BRIDGE_SECRET` | A random password the iOS app will send to prove it's allowed to register. Make something up, e.g. `hunter2-studio-push` |
-| `DB_PATH` | Leave as `./bridge_tokens.db` |
-| `LOG_LEVEL` | Leave as `INFO` |
+# A Kitsu account with admin access used by the bridge as a service account
+KITSU_EMAIL=admin@yourstudio.com
+KITSU_PASSWORD=your-kitsu-password
 
-Lock down the `.env` file so only the system can read it (it contains passwords):
+# APNs credentials from developer.apple.com
+APNS_KEY_PATH=/etc/kitsu-push-bridge/AuthKey_XXXXXXXXXX.p8
+APNS_KEY_ID=XXXXXXXXXX
+APNS_TEAM_ID=XXXXXXXXXX
+APNS_BUNDLE_ID=com.kitsureview.app
+
+# Use true for TestFlight/development builds, false for App Store production
+APNS_SANDBOX=true
+
+# Bridge HTTP server — listens on localhost, Nginx proxies externally
+BRIDGE_HOST=127.0.0.1
+BRIDGE_PORT=9090
+
+# Optional: require this secret header (X-Bridge-Secret) on all API requests
+# Set the same value in the iOS app settings if the bridge is internet-accessible
+BRIDGE_SECRET=
+
+# Token database location
+DB_PATH=/opt/kitsu-push-bridge/bridge_tokens.db
+
+# Logging: DEBUG, INFO, WARNING, ERROR
+LOG_LEVEL=INFO
+```
 
 ```bash
 sudo chmod 600 /opt/kitsu-push-bridge/.env
 ```
 
-> **About `APNS_SANDBOX`:** If you built the app yourself with Expo and installed it via USB or internal TestFlight, use `true`. If you downloaded it from the App Store, use `false`. Using the wrong one causes notifications to silently fail.
-
 ---
 
-## Step 5 — Test it manually first
-
-Before setting it up to run automatically, let's make sure it works:
+## Step 5 — Test manually
 
 ```bash
 cd /opt/kitsu-push-bridge
-sudo .venv/bin/python3 main.py
+source venv/bin/activate
+python3 main.py
 ```
 
-You should see output like:
+You should see:
 
 ```
-2025-01-01 12:00:00  INFO      bridge.main  Kitsu Push Bridge starting  kitsu=http://...
-2025-01-01 12:00:01  INFO      bridge.kitsu  Logged into Kitsu as push-bridge@...
-2025-01-01 12:00:01  INFO      bridge.kitsu  Socket.IO connected to Kitsu
+2026-01-01 12:00:00  INFO  bridge.main  Kitsu Push Bridge starting  kitsu=http://192.168.1.2 ...
+2026-01-01 12:00:01  INFO  bridge.kitsu  Logged into Kitsu as admin@yourstudio.com
+2026-01-01 12:00:01  INFO  bridge.kitsu  Socket.IO connected to Kitsu (/events)
 ```
 
-If you see errors, double-check your `.env` values. Press `Ctrl+C` to stop it once you're happy it's working.
+Press `Ctrl+C` to stop.
 
 ---
 
-## Step 6 — Run it automatically as a background service
+## Step 6 — Set up Nginx proxy
 
-Right now the bridge only runs while your terminal is open. To make it start automatically and keep running in the background (even after a reboot), we register it as a **systemd service** — Ubuntu's built-in system for managing long-running programs.
+The bridge listens on `localhost:9090`. Nginx exposes it externally under a sub-path of your Kitsu domain.
 
-Create the service file:
+```bash
+sudo nano /etc/nginx/sites-available/kitsu-push-bridge
+```
+
+```nginx
+server {
+    listen 80;
+    server_name your-server-ip-or-domain;
+
+    location /push-bridge/ {
+        proxy_pass         http://127.0.0.1:9090/;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_read_timeout 30s;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/kitsu-push-bridge /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Test it:
+
+```bash
+curl http://your-server-ip/push-bridge/health
+# → {"status": "ok"}
+```
+
+---
+
+## Step 7 — Run as a system service
 
 ```bash
 sudo nano /etc/systemd/system/kitsu-push-bridge.service
 ```
-
-Paste in the following (press `Ctrl+Shift+V` to paste in most terminals):
 
 ```ini
 [Unit]
@@ -209,10 +245,11 @@ Description=Kitsu Push Bridge
 After=network.target
 
 [Service]
-User=root
+Type=simple
+User=www-data
 WorkingDirectory=/opt/kitsu-push-bridge
+ExecStart=/opt/kitsu-push-bridge/venv/bin/python3 main.py
 EnvironmentFile=/opt/kitsu-push-bridge/.env
-ExecStart=/opt/kitsu-push-bridge/.venv/bin/python3 main.py
 Restart=always
 RestartSec=10
 
@@ -220,115 +257,44 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Save and close (`Ctrl+X` → `Y` → `Enter`), then activate it:
-
 ```bash
-# Tell systemd about the new service
+sudo chown -R www-data:www-data /opt/kitsu-push-bridge
+sudo chmod 600 /opt/kitsu-push-bridge/.env
+
 sudo systemctl daemon-reload
-
-# Start it now AND make it start automatically on every boot
-sudo systemctl enable --now kitsu-push-bridge
-```
-
-Check it's running:
-
-```bash
+sudo systemctl enable kitsu-push-bridge
+sudo systemctl start kitsu-push-bridge
 sudo systemctl status kitsu-push-bridge
 ```
 
-You should see `Active: active (running)` in green. To watch the live log output:
+View live logs:
 
 ```bash
-sudo journalctl -fu kitsu-push-bridge
+sudo journalctl -u kitsu-push-bridge -f
 ```
-
-Press `Ctrl+C` to stop watching the logs (the service keeps running).
 
 ---
 
-## Step 7 — Make it reachable from outside your network (Nginx)
-
-The bridge currently only listens on `127.0.0.1:9090` — it cannot be reached from the internet, which is intentional. If your Kitsu server is already behind Nginx (common with Kitsu installations), you can add the bridge as a sub-path so the iOS app can register from anywhere.
-
-Check if Nginx is installed:
+## Updating the bridge
 
 ```bash
-nginx -v
-```
-
-If it isn't: `sudo apt install -y nginx`
-
-Find your existing Kitsu Nginx config (usually in `/etc/nginx/sites-enabled/`) and add this block inside the `server { }` section:
-
-```nginx
-location /push-bridge/ {
-    proxy_pass http://127.0.0.1:9090/;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-}
-```
-
-Reload Nginx to apply the change:
-
-```bash
-sudo nginx -t        # check for typos — should say "syntax is ok"
-sudo systemctl reload nginx
-```
-
-The bridge is now reachable at `https://kitsu.mystudio.com/push-bridge/health` — open that URL in a browser to confirm you see `{"status":"ok"}`.
-
-In the iOS app login screen, enter the Push Bridge URL as:
-```
-https://kitsu.mystudio.com/push-bridge
-```
-
-> **HTTP vs HTTPS:** iOS blocks plain HTTP calls to internet/public addresses (Apple's App Transport Security rules). However, HTTP works fine when the bridge is on your local studio network or accessed over a VPN — iOS allows HTTP to private IP ranges without any special configuration.
-> - Studio LAN / same Wi-Fi as Kitsu: `http://192.168.1.50:9090` works ✅
-> - Accessed over a VPN back to the studio: HTTP works ✅  
-> - Exposed on a public internet domain: HTTPS required ❌
->
-> If you do need HTTPS, see the [Certbot / Let's Encrypt guide](https://certbot.eff.org/instructions?ws=nginx&os=ubuntufocal) for a free SSL certificate.
-
----
-
-## Useful commands
-
-```bash
-# Check if the bridge is running
-sudo systemctl status kitsu-push-bridge
-
-# Restart it (e.g. after changing .env)
+cd /opt/kitsu-push-bridge
+sudo git pull
 sudo systemctl restart kitsu-push-bridge
-
-# Stop it
-sudo systemctl stop kitsu-push-bridge
-
-# Watch live logs
-sudo journalctl -fu kitsu-push-bridge
-
-# See the last 50 log lines
-sudo journalctl -u kitsu-push-bridge -n 50
 ```
 
----
+If `requirements.txt` changed:
 
-## Notification events
-
-| Kitsu event | Who gets notified | Message |
-|---|---|---|
-| `comment:new` | All task assignees (except the commenter) | Commenter name + comment preview |
-| `task:status-changed` | All task assignees (except who changed it) | New status name |
-| `task:to-review` | All task assignees | "Your submission is now pending review." |
-| `task:assign` | The newly assigned person | "You have been assigned to this task." |
-| `preview-file:new` | All task assignees | "A new revision has been uploaded." |
-
-Tapping any notification opens the task review screen directly in the iOS app.
+```bash
+sudo -u www-data /opt/kitsu-push-bridge/venv/bin/pip install -r requirements.txt
+sudo systemctl restart kitsu-push-bridge
+```
 
 ---
 
 ## HTTP API reference
 
-The bridge exposes a minimal REST API used by the iOS app automatically — you don't need to call these yourself.
+The bridge exposes a minimal REST API used by the iOS app automatically.
 
 ### `POST /push-tokens` — Register a device
 
@@ -340,7 +306,7 @@ The bridge exposes a minimal REST API used by the iOS app automatically — you 
 }
 ```
 
-The bridge verifies the `kitsu_token` against the Kitsu API before storing the token. Returns `204 No Content`.
+The bridge verifies the `kitsu_token` against `/api/auth/authenticated` before storing the token. Returns `204 No Content`.
 
 ### `DELETE /push-tokens` — Unregister a device
 
@@ -357,14 +323,57 @@ Returns `204 No Content`.
 
 Returns `{"status": "ok"}`.
 
+**Optional header on all requests** (when `BRIDGE_SECRET` is set):
+
+```
+X-Bridge-Secret: your-secret-value
+```
+
+---
+
+## APNs environment
+
+`APNS_SANDBOX=true` is required for TestFlight and Xcode development builds.
+Set `APNS_SANDBOX=false` for App Store production builds.
+
+A device token is environment-specific — a sandbox token will not work with production APNs and vice versa. You will need to redeploy with `APNS_SANDBOX=false` when you publish to the App Store.
+
 ---
 
 ## Security notes
 
-- The bridge verifies every registration request against the Kitsu API — a valid Kitsu JWT is required to store a token.
-- Set `BRIDGE_SECRET` to a strong random string and configure it in the iOS app if the bridge is internet-accessible.
-- Keep your `.p8` key and `.env` file outside version control and restrict file permissions (`chmod 600`).
-- Use HTTPS in production (Nginx + Let's Encrypt).
+- Every token registration is verified against the Kitsu API — a valid Kitsu JWT is required.
+- Set `BRIDGE_SECRET` to a strong random string if the bridge is internet-accessible, and configure the matching value in the iOS app.
+- Keep your `.p8` key file and `.env` outside version control. Use `chmod 600` on both.
+- Use HTTPS (Nginx + Let's Encrypt) in production.
+- The token database (`bridge_tokens.db`) contains APNs device tokens — protect it with appropriate file permissions.
+
+---
+
+## Troubleshooting
+
+**Bridge will not connect to Kitsu**
+```bash
+curl http://192.168.1.2/api/health
+curl -X POST http://192.168.1.2/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"admin@yourstudio.com","password":"yourpassword"}'
+```
+
+**APNs rejects the key**
+- Ensure the `.p8` file ends with a newline: `echo "" >> /etc/kitsu-push-bridge/AuthKey_XXXXXXXXXX.p8`
+- Confirm `APNS_KEY_ID` and `APNS_TEAM_ID` match exactly what developer.apple.com shows.
+- Confirm `APNS_BUNDLE_ID` matches your app's bundle identifier exactly (e.g. `com.kitsureview.app`).
+- Check you are using the correct sandbox/production setting for your build type.
+
+**Notifications do not arrive**
+- Set `LOG_LEVEL=DEBUG`, restart, and watch `journalctl -u kitsu-push-bridge -f` while triggering an event in Kitsu.
+- Confirm `Socket.IO connected to Kitsu (/events)` appears in the logs.
+- Confirm `Registered APNs token for user` appeared when the iOS app logged in.
+
+**Notifications arrive but tapping does not open the task**
+- Ensure the iOS app build includes the notification tap handler.
+- Confirm `notification_id` and `task_id` appear in the notification payload (visible in logs at DEBUG level).
 
 ---
 

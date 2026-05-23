@@ -35,6 +35,7 @@ class PushSender:
         tokens: List[str],
         title: str,
         body: str,
+        subtitle: str = "",
         data: Dict[str, Any] | None = None,
         sound: str = "default",
     ) -> None:
@@ -42,19 +43,23 @@ class PushSender:
             return
 
         for token in tokens:
-            await self._send_one(token, title, body, data or {}, sound)
+            await self._send_one(token, title, body, subtitle, data or {}, sound)
 
     async def _send_one(
         self,
         device_token: str,
         title: str,
         body: str,
+        subtitle: str,
         data: Dict[str, Any],
         sound: str,
     ) -> None:
+        alert: Dict[str, Any] = {"title": title, "body": body}
+        if subtitle:
+            alert["subtitle"] = subtitle
         payload: Dict[str, Any] = {
             "aps": {
-                "alert": {"title": title, "body": body},
+                "alert": alert,
                 "sound": sound,
             },
         }
