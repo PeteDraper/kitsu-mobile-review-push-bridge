@@ -62,7 +62,7 @@ nano /opt/kitsu-push-bridge/.env
 
 ```env
 # Full URL to your Kitsu instance — no trailing slash
-KITSU_URL=http://192.168.1.2
+KITSU_URL=http://your-kitsu-instance-ip-or-localhost
 
 # A Kitsu admin account used exclusively by the bridge
 KITSU_EMAIL=push-bridge@yourstudio.com
@@ -184,12 +184,8 @@ Check that `KITSU_URL` matches the address your server is actually reachable on.
 
 **Notifications not arriving**
 - Confirm `Socket.IO connected` appears in the logs.
-- Confirm `Registered APNs token for user` appears after a team member logs in.
+- Confirm `Registered APNs token for user` appears after a team member logs in. NOTE - if the server restarts, the user will need to log back in again to re-register the token.
 - Check `sudo journalctl -u kitsu-push-bridge -f` while triggering an event in Kitsu.
-- Ensure the app was installed from the App Store (not a dev/TestFlight build).
-
-**Notifications arrive but tapping does not open the task**
-- Ensure the app is up to date from the App Store.
 
 ---
 
