@@ -23,6 +23,7 @@ class KitsuClient:
         self.store = store
         self.pusher = pusher
         self._token: Optional[str] = None
+        self._bridge_person_id: Optional[str] = None   # set on login; used to suppress service-account name
         self._sio = socketio.AsyncClient(reconnection=False, logger=False)
         self._register_handlers()
 
@@ -43,7 +44,16 @@ class KitsuClient:
                 token = data.get("access_token") or data.get("token")
                 if not token:
                     raise RuntimeError(f"No token in Kitsu login response: {data}")
-                logger.info("Logged into Kitsu as %s", self.config.kitsu_email)
+
+                # Cache the bridge service account's own person_id so we can
+                # suppress it from appearing as an author name in notifications.
+                user = data.get("user") or {}
+                self._bridge_person_id = user.get("id") or user.get("person_id")
+                logger.info(
+                    "Logged into Kitsu as %s (person_id=%s)",
+                    self.config.kitsu_email,
+                    self._bridge_person_id,
+                )
                 return token
 
     async def _token_refresh_loop(self) -> None:
@@ -87,20 +97,16 @@ class KitsuClient:
     async def _get_playlist(self, playlist_id: str) -> Optional[Dict]:
         return await self._api_get(f"/data/playlists/{playlist_id}")
 
-    # ── Display helpers — mirrors Kitsu's buildBody / buildTitle exactly ───────
+    # ── Display helpers — mirrors Kitsu notification page exactly ──────────────
 
     @staticmethod
     def _full_entity_name(task: Dict) -> str:
         """
-        Mirrors Zou's names_service.get_full_entity_name().
-        Shot with episode  → "Episode / Sequence / Shot"
-        Shot without ep    → "Sequence / Shot"
-        Asset              → "AssetType / Asset"
-        Other              → "Entity"
-        The task dict from /data/tasks/{id}?relations=true carries
-        episode_name (blank when sequence has no parent), sequence_name,
-        entity_name, entity_type_name, and sequence_name doubles as the
-        asset-type name for assets.
+        Mirrors Zou's names_service.get_full_entity_name():
+          Shot with episode  → "Episode / Sequence / Shot"
+          Shot without ep    → "Sequence / Shot"
+          Asset              → "AssetType / Asset"   (sequence_name = asset type in Zou)
+          Other              → entity_name
         """
         entity_type = task.get("entity_type_name") or ""
         entity      = task.get("entity_name") or ""
@@ -112,7 +118,6 @@ class KitsuClient:
                 return f"{episode} / {sequence} / {entity}"
             return f"{sequence} / {entity}"
         elif entity_type == "Asset":
-            # sequence_name carries the asset-type name in Zou's data model
             if sequence:
                 return f"{sequence} / {entity}"
             return entity
@@ -122,73 +127,72 @@ class KitsuClient:
     @staticmethod
     def _build_body(task: Dict) -> str:
         """
-        Mirrors Kitsu's buildBody(): project_name / full_entity_name / task_type_name
+        Mirrors Kitsu's buildBody():  project_name / full_entity_name / task_type_name
         """
         project   = task.get("project_name") or ""
         task_type = task.get("task_type_name") or ""
         entity    = KitsuClient._full_entity_name(task)
-
-        parts = [p for p in [project, entity, task_type] if p]
+        parts     = [p for p in [project, entity, task_type] if p]
         return " / ".join(parts)
 
-    @staticmethod
-    def _build_subtitle(ntype: str, author_name: str, is_publish: bool = False) -> str:
+    def _build_subtitle(
+        self,
+        ntype: str,
+        author_id: str,
+        author_name: str,
+        is_publish: bool = False,
+    ) -> str:
         """
-        Mirrors Kitsu's buildTitle() using exact English locale strings:
-          comment_title:    '{name} commented'
-          publish_title:    '{name} published a preview'
-          mention_title:    '{name} mentioned you'
-          reply_title:      '{name} replied'
-          assignation_title:'{name} assigned you'
-        reply-mention shares the mention wording.
+        Mirrors Kitsu's desktop notification title strings (English locale).
+        When the author is the bridge's own service account, the name is
+        suppressed and a clean verb-only form is used instead.
+
+        With name:    "{Name} commented", "{Name} mentioned you", etc.
+        Without name: "New comment", "Mentioned you", etc.
         """
-        name = author_name or "Someone"
+        # Suppress service-account name so it never appears in a notification
+        is_service_account = bool(
+            self._bridge_person_id and author_id == self._bridge_person_id
+        )
+        name = "" if is_service_account else (author_name or "")
+
         if ntype in ("mention", "reply-mention"):
-            return f"{name} mentioned you"
+            return f"{name} mentioned you" if name else "Mentioned you"
         if ntype == "reply":
-            return f"{name} replied"
+            return f"{name} replied" if name else "Replied"
         if ntype == "assignation":
-            return f"{name} assigned you"
+            return f"{name} assigned you" if name else "Assigned to you"
         if ntype == "comment":
             if is_publish:
-                return f"{name} published a preview"
-            return f"{name} commented"
-        # fallback
-        return f"{name} commented"
+                return f"{name} published a preview" if name else "Preview published"
+            return f"{name} commented" if name else "New comment"
+        # Fallback — treat as a comment
+        return f"{name} commented" if name else "New comment"
 
     # ── Notification dispatch ──────────────────────────────────────────────────
 
     _APP_NAME = "Kitsu Mobile Review"
 
-    async def _notify_users(
+    async def _notify(
         self,
-        user_ids: List[str],
+        tokens: List[str],
         subtitle: str,
         body: str,
         data: Dict[str, Any],
-        exclude_user_id: Optional[str] = None,
     ) -> None:
-        for user_id in user_ids:
-            if user_id == exclude_user_id:
-                continue
-            tokens = await self.store.get_tokens_for_user(user_id)
-            if tokens:
-                logger.info(
-                    "Notifying user %s (%d token(s)): %s", user_id, len(tokens), subtitle
-                )
-                await self.pusher.send(
-                    tokens=tokens,
-                    title=self._APP_NAME,
-                    subtitle=subtitle,
-                    body=body,
-                    data=data,
-                )
+        """Send to an already-resolved list of tokens."""
+        await self.pusher.send(
+            tokens=tokens,
+            title=self._APP_NAME,
+            subtitle=subtitle,
+            body=body,
+            data=data,
+        )
 
     # ── Socket.IO event handlers ───────────────────────────────────────────────
 
     def _register_handlers(self) -> None:
         sio = self._sio
-
         NS = "/events"
 
         @sio.event(namespace=NS)
@@ -207,248 +211,160 @@ class KitsuClient:
         async def on_any(event, data):
             logger.debug("Socket.IO event: %s  data=%s", event, str(data)[:200])
 
+        # PRIMARY: Kitsu already resolves recipients — one event per person.
         @sio.on("notification:new", namespace=NS)
         async def on_notification_new(data):
             asyncio.create_task(self._handle_notification_new(data))
 
-        @sio.on("comment:new", namespace=NS)
-        async def on_comment_new(data):
-            asyncio.create_task(self._handle_comment_new(data))
+        # SECONDARY: kept as no-ops.  notification:new covers all cases that
+        # matter. Listening to these as well would cause duplicate pushes.
+        @sio.on("comment:new",      namespace=NS)
+        async def on_comment_new(data):    pass
 
-        @sio.on("task:update", namespace=NS)
-        async def on_task_update(data):
-            asyncio.create_task(self._handle_task_update(data))
+        @sio.on("task:update",      namespace=NS)
+        async def on_task_update(data):    pass
 
-        @sio.on("task:to-review", namespace=NS)
-        async def on_to_review(data):
-            asyncio.create_task(self._handle_to_review(data))
+        @sio.on("task:to-review",   namespace=NS)
+        async def on_to_review(data):      pass
 
-        @sio.on("task:assign", namespace=NS)
-        async def on_assign(data):
-            asyncio.create_task(self._handle_assign(data))
+        @sio.on("task:assign",      namespace=NS)
+        async def on_assign(data):         pass
 
         @sio.on("preview-file:new", namespace=NS)
-        async def on_preview_new(data):
-            asyncio.create_task(self._handle_preview_new(data))
+        async def on_preview_new(data):    pass
+
+    # ── Primary handler ────────────────────────────────────────────────────────
 
     async def _handle_notification_new(self, data: Dict) -> None:
         """
-        PRIMARY push trigger.  Kitsu fires notification:new with person_id
-        already resolved — the server decides who gets notified.
+        Kitsu fires notification:new once per recipient — it has already
+        resolved who should see the notification.
 
+        Socket event payload: { notification_id, person_id }
         Notification types (Zou): comment, mention, reply, reply-mention,
-        assignation, playlist-ready.
-        A 'comment' notification is treated as 'publish' when its linked
+                                   assignation, playlist-ready.
+        A "comment" notification is treated as "publish" when the linked
         comment has a preview file attached.
 
         Subtitle mirrors Kitsu's desktop notification title strings exactly.
         Body mirrors Kitsu's buildBody(): project / entity_path / task_type.
-        Data payload includes notification_id so the app can mark it read on tap
-        and navigate directly to the task.
+        notification_id is included in the payload so the app can mark it
+        read on tap and navigate directly to the task.
         """
         person_id       = data.get("person_id")
-        notification_id = data.get("notification_id")
-        project_id      = data.get("project_id", "")
+        notification_id = data.get("notification_id") or ""
         if not person_id:
             return
 
         tokens = await self.store.get_tokens_for_user(person_id)
         if not tokens:
+            logger.debug("notification:new — no tokens for user %s, skipping", person_id)
             return
 
+        # Defaults used when the notification record cannot be enriched
         subtitle = "New notification"
-        body     = "You have new activity."
+        body     = ""
         task_id  = ""
 
         if not notification_id:
-            # Nothing to enrich — send the bare minimum
-            logger.info("Notifying user %s (no notification_id)", person_id)
-            await self.pusher.send(
-                tokens=tokens,
-                title=self._APP_NAME,
-                subtitle=subtitle,
-                body=body,
-                data={"type": "notification:new", "task_id": task_id, "project_id": project_id,
-                      "notification_id": ""},
+            logger.warning("notification:new — missing notification_id in event data; sending bare push")
+            await self._notify(
+                tokens, subtitle, body,
+                {"type": "notification:new", "task_id": "", "project_id": "",
+                 "notification_id": ""},
             )
             return
 
         notif = await self._api_get(f"/data/notifications/{notification_id}")
         if not notif:
+            logger.warning("notification:new — could not fetch notification %s", notification_id)
             return
 
-        ntype      = notif.get("notification_type") or notif.get("type") or "comment"
-        task_id    = notif.get("task_id") or ""
-        author_id  = notif.get("author_id") or ""
-        comment_id = notif.get("comment_id") or ""
-        playlist_id= notif.get("playlist_id") or ""
+        ntype       = notif.get("notification_type") or notif.get("type") or "comment"
+        task_id     = notif.get("task_id") or ""
+        author_id   = notif.get("author_id") or ""
+        comment_id  = notif.get("comment_id") or ""
+        playlist_id = notif.get("playlist_id") or ""
 
+        logger.debug(
+            "notification:new — id=%s type=%s task_id=%s author_id=%s comment_id=%s",
+            notification_id, ntype, task_id, author_id, comment_id,
+        )
+
+        # Fetch author and task concurrently
         async def _noop() -> None:
             return None
 
-        # Fetch author name and task concurrently
-        results = await asyncio.gather(
+        person_result, task_result = await asyncio.gather(
             self._get_person(author_id) if author_id else _noop(),
-            self._get_task(task_id) if task_id else _noop(),
+            self._get_task(task_id)     if task_id  else _noop(),
             return_exceptions=True,
         )
-        person_result = results[0] if not isinstance(results[0], Exception) else None
-        task_result   = results[1] if not isinstance(results[1], Exception) else None
+        if isinstance(person_result, Exception):
+            logger.warning("Failed to fetch author %s: %s", author_id, person_result)
+            person_result = None
+        if isinstance(task_result, Exception):
+            logger.warning("Failed to fetch task %s: %s", task_id, task_result)
+            task_result = None
 
         author_name = ""
         if person_result:
             author_name = person_result.get("full_name") or person_result.get("name") or ""
 
-        # Build body from task breadcrumb (matches Kitsu's buildBody)
+        # Build body breadcrumb from task (project / entity path / task type)
         if task_result:
             body = self._build_body(task_result)
+            if not body:
+                logger.warning(
+                    "notification:new — _build_body returned empty for task %s "
+                    "(project_name=%r entity_type_name=%r entity_name=%r "
+                    "sequence_name=%r episode_name=%r task_type_name=%r)",
+                    task_id,
+                    task_result.get("project_name"),
+                    task_result.get("entity_type_name"),
+                    task_result.get("entity_name"),
+                    task_result.get("sequence_name"),
+                    task_result.get("episode_name"),
+                    task_result.get("task_type_name"),
+                )
+        else:
+            logger.warning(
+                "notification:new — no task result for task_id=%r (notification=%s)",
+                task_id, notification_id,
+            )
 
-        # Detect publish: a comment notification where the comment has a preview
+        # Detect publish: a comment notification whose comment has a preview file
         is_publish = False
         if ntype == "comment" and comment_id:
             comment = await self._get_comment(comment_id)
             if comment:
                 is_publish = bool(
-                    comment.get("preview_file_id")
-                    or comment.get("previews")
+                    comment.get("preview_file_id") or comment.get("previews")
                 )
 
-        # playlist-ready: no task — use playlist name as body
+        # playlist-ready is not task-linked — use playlist name as body
         if ntype == "playlist-ready" and playlist_id:
             playlist = await self._get_playlist(playlist_id)
             playlist_name = (playlist or {}).get("name") or "Playlist"
             subtitle = f"{playlist_name} is ready"
-            body     = (playlist or {}).get("project_name") or body
+            if not body:
+                body = (playlist or {}).get("project_name") or ""
         else:
-            subtitle = self._build_subtitle(ntype, author_name, is_publish)
+            subtitle = self._build_subtitle(ntype, author_id, author_name, is_publish)
 
-        logger.info("notification:new → user %s  subtitle=%r  body=%r", person_id, subtitle, body)
-        await self.pusher.send(
-            tokens=tokens,
-            title=self._APP_NAME,
-            subtitle=subtitle,
-            body=body,
-            data={
-                "type": "notification:new",
-                "task_id": task_id,
-                "project_id": project_id,
+        logger.info(
+            "notification:new → user=%s  subtitle=%r  body=%r  task_id=%s",
+            person_id, subtitle, body, task_id,
+        )
+
+        await self._notify(
+            tokens, subtitle, body,
+            {
+                "type":            "notification:new",
+                "task_id":         task_id,
+                "project_id":      (task_result or {}).get("project_id") or "",
                 "notification_id": notification_id,
             },
-        )
-
-    async def _handle_comment_new(self, data: Dict) -> None:
-        """
-        Fallback for comment:new events not already covered by notification:new.
-        Uses the same subtitle/body format as _handle_notification_new.
-        """
-        task_id = data.get("task_id") or (data.get("comment") or {}).get("task_id")
-        if not task_id:
-            return
-
-        comment      = data.get("comment") or {}
-        commenter_id = comment.get("person_id")
-        is_publish   = bool(comment.get("preview_file_id") or comment.get("previews"))
-
-        task = await self._get_task(task_id)
-        if not task:
-            return
-
-        assignees: List[str] = task.get("assignees", [])
-        body = self._build_body(task)
-
-        author_name = ""
-        if commenter_id:
-            person = await self._get_person(commenter_id)
-            if person:
-                author_name = person.get("full_name") or person.get("name") or ""
-
-        subtitle = self._build_subtitle("comment", author_name, is_publish)
-
-        await self._notify_users(
-            assignees,
-            subtitle=subtitle,
-            body=body,
-            data={"type": "comment:new", "task_id": task_id,
-                  "project_id": task.get("project_id", ""), "notification_id": ""},
-            exclude_user_id=commenter_id,
-        )
-
-    async def _handle_task_update(self, data: Dict) -> None:
-        """
-        task:update fires for many internal changes.  notification:new already
-        handles targeted pushes for status changes, so this is a no-op to
-        avoid double-notifying.
-        """
-        pass
-
-    async def _handle_to_review(self, data: Dict) -> None:
-        task_id = data.get("task_id")
-        if not task_id:
-            return
-
-        task = await self._get_task(task_id)
-        if not task:
-            return
-
-        assignees: List[str] = task.get("assignees", [])
-        body = self._build_body(task)
-
-        await self._notify_users(
-            assignees,
-            subtitle="Sent to review",
-            body=body,
-            data={"type": "task:to-review", "task_id": task_id,
-                  "project_id": task.get("project_id", ""), "notification_id": ""},
-        )
-
-    async def _handle_assign(self, data: Dict) -> None:
-        task_id   = data.get("task_id")
-        person_id = data.get("person_id")
-        if not task_id or not person_id:
-            return
-
-        task = await self._get_task(task_id)
-        if not task:
-            return
-
-        body = self._build_body(task)
-
-        # Fetch assigner name to match "{name} assigned you"
-        assigner_id   = data.get("assigner_id") or ""
-        assigner_name = ""
-        if assigner_id:
-            assigner = await self._get_person(assigner_id)
-            if assigner:
-                assigner_name = assigner.get("full_name") or assigner.get("name") or ""
-
-        subtitle = self._build_subtitle("assignation", assigner_name)
-
-        await self._notify_users(
-            [person_id],
-            subtitle=subtitle,
-            body=body,
-            data={"type": "task:assign", "task_id": task_id,
-                  "project_id": task.get("project_id", ""), "notification_id": ""},
-        )
-
-    async def _handle_preview_new(self, data: Dict) -> None:
-        task_id = data.get("task_id")
-        if not task_id:
-            return
-
-        task = await self._get_task(task_id)
-        if not task:
-            return
-
-        assignees: List[str] = task.get("assignees", [])
-        body = self._build_body(task)
-
-        await self._notify_users(
-            assignees,
-            subtitle="New revision uploaded",
-            body=body,
-            data={"type": "preview-file:new", "task_id": task_id,
-                  "project_id": task.get("project_id", ""), "notification_id": ""},
         )
 
     # ── Socket.IO connection loop ──────────────────────────────────────────────
