@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import socketio
@@ -15,6 +16,10 @@ logger = logging.getLogger(__name__)
 RECONNECT_DELAY = 10
 # JWT is valid for 12 h in Kitsu; refresh 30 min before expiry
 TOKEN_REFRESH_INTERVAL = 11 * 60 * 60
+# Suppress duplicate pushes for the same (person, task) within this window.
+# Kitsu fires both a "mention" and a "comment" notification:new for the same
+# comment, arriving within milliseconds of each other.
+DEDUP_WINDOW_SECS = 4.0
 
 
 class KitsuClient:
@@ -23,8 +28,12 @@ class KitsuClient:
         self.store = store
         self.pusher = pusher
         self._token: Optional[str] = None
-        self._bridge_person_id: Optional[str] = None   # set on login; used to suppress service-account name
+        # Bridge service-account person_id — cached at login so it can be
+        # suppressed from appearing as an author name in notifications.
+        self._bridge_person_id: Optional[str] = None
         self._sio = socketio.AsyncClient(reconnection=False, logger=False)
+        # Dedup table: (person_id, task_id) → monotonic send-time
+        self._recent_pushes: Dict[Tuple[str, str], float] = {}
         self._register_handlers()
 
     # ── Authentication ─────────────────────────────────────────────────────────
@@ -44,9 +53,6 @@ class KitsuClient:
                 token = data.get("access_token") or data.get("token")
                 if not token:
                     raise RuntimeError(f"No token in Kitsu login response: {data}")
-
-                # Cache the bridge service account's own person_id so we can
-                # suppress it from appearing as an author name in notifications.
                 user = data.get("user") or {}
                 self._bridge_person_id = user.get("id") or user.get("person_id")
                 logger.info(
@@ -85,9 +91,6 @@ class KitsuClient:
             logger.error("Kitsu API GET %s error: %s", path, e)
         return None
 
-    async def _get_task(self, task_id: str) -> Optional[Dict]:
-        return await self._api_get(f"/data/tasks/{task_id}?relations=true")
-
     async def _get_person(self, person_id: str) -> Optional[Dict]:
         return await self._api_get(f"/data/persons/{person_id}")
 
@@ -97,6 +100,85 @@ class KitsuClient:
     async def _get_playlist(self, playlist_id: str) -> Optional[Dict]:
         return await self._api_get(f"/data/playlists/{playlist_id}")
 
+    # ── Task enrichment ────────────────────────────────────────────────────────
+    #
+    # /data/tasks/{id} returns raw model fields only: entity_id (UUID),
+    # task_type_id (UUID), project_id (UUID) — no human-readable names.
+    # The flat _name fields only appear via _convert_rows_to_detailed_tasks
+    # (a JOIN query used by list endpoints).  We resolve the breadcrumb with
+    # up to three rounds of parallel API calls:
+    #
+    #   Round 1: task raw fields
+    #   Round 2: entity + task_type + project (parallel)
+    #   Round 3: entity_type + parent entity (sequence) (parallel)
+    #   Round 4: grandparent entity (episode) — only when sequence has a parent
+
+    async def _safe_get(self, path: str) -> Optional[Dict]:
+        """GET with exception swallowed — safe to use inside asyncio.gather."""
+        try:
+            return await self._api_get(path)
+        except Exception as e:
+            logger.debug("_safe_get %s: %s", path, e)
+            return None
+
+    async def _get_task_info(self, task_id: str) -> Optional[Dict]:
+        """
+        Return a flat dict with the keys _build_body expects:
+            project_id, project_name,
+            entity_id, entity_name, entity_type_name,
+            sequence_name, episode_name,
+            task_type_id, task_type_name
+        """
+        # Round 1 — raw task
+        raw = await self._api_get(f"/data/tasks/{task_id}")
+        if not raw:
+            return None
+
+        entity_id    = raw.get("entity_id") or ""
+        task_type_id = raw.get("task_type_id") or ""
+        project_id   = raw.get("project_id") or ""
+
+        # Round 2 — entity + task_type + project in parallel
+        entity_r, task_type_r, project_r = await asyncio.gather(
+            self._safe_get(f"/data/entities/{entity_id}")    if entity_id    else asyncio.sleep(0),
+            self._safe_get(f"/data/task-types/{task_type_id}") if task_type_id else asyncio.sleep(0),
+            self._safe_get(f"/data/projects/{project_id}")   if project_id   else asyncio.sleep(0),
+        )
+
+        entity_name      = (entity_r or {}).get("name") or ""
+        entity_type_id   = (entity_r or {}).get("entity_type_id") or ""
+        parent_id        = (entity_r or {}).get("parent_id") or ""   # sequence ID for shots
+        task_type_name   = (task_type_r or {}).get("name") or ""
+        project_name     = (project_r or {}).get("name") or ""
+
+        # Round 3 — entity_type name + sequence name (parallel)
+        entity_type_r, sequence_r = await asyncio.gather(
+            self._safe_get(f"/data/entity-types/{entity_type_id}") if entity_type_id else asyncio.sleep(0),
+            self._safe_get(f"/data/entities/{parent_id}")           if parent_id      else asyncio.sleep(0),
+        )
+
+        entity_type_name = (entity_type_r or {}).get("name") or ""
+        sequence_name    = (sequence_r or {}).get("name") or ""
+        seq_parent_id    = (sequence_r or {}).get("parent_id") or ""  # episode ID for TV
+
+        # Round 4 — episode name (only for TV shows where sequence has a parent)
+        episode_name = ""
+        if seq_parent_id:
+            episode_r = await self._safe_get(f"/data/entities/{seq_parent_id}")
+            episode_name = (episode_r or {}).get("name") or ""
+
+        return {
+            "project_id":       project_id,
+            "project_name":     project_name,
+            "entity_id":        entity_id,
+            "entity_name":      entity_name,
+            "entity_type_name": entity_type_name,
+            "sequence_name":    sequence_name,
+            "episode_name":     episode_name,
+            "task_type_id":     task_type_id,
+            "task_type_name":   task_type_name,
+        }
+
     # ── Display helpers — mirrors Kitsu notification page exactly ──────────────
 
     @staticmethod
@@ -105,7 +187,7 @@ class KitsuClient:
         Mirrors Zou's names_service.get_full_entity_name():
           Shot with episode  → "Episode / Sequence / Shot"
           Shot without ep    → "Sequence / Shot"
-          Asset              → "AssetType / Asset"   (sequence_name = asset type in Zou)
+          Asset              → "AssetType / Asset"
           Other              → entity_name
         """
         entity_type = task.get("entity_type_name") or ""
@@ -116,9 +198,11 @@ class KitsuClient:
         if entity_type in ("Shot", "Scene"):
             if episode:
                 return f"{episode} / {sequence} / {entity}"
-            return f"{sequence} / {entity}"
-        elif entity_type == "Asset":
             if sequence:
+                return f"{sequence} / {entity}"
+            return entity
+        elif entity_type == "Asset":
+            if sequence:           # sequence_name holds asset-type for assets
                 return f"{sequence} / {entity}"
             return entity
         else:
@@ -127,7 +211,7 @@ class KitsuClient:
     @staticmethod
     def _build_body(task: Dict) -> str:
         """
-        Mirrors Kitsu's buildBody():  project_name / full_entity_name / task_type_name
+        Body breadcrumb: project_name / full_entity_name / task_type_name
         """
         project   = task.get("project_name") or ""
         task_type = task.get("task_type_name") or ""
@@ -144,13 +228,10 @@ class KitsuClient:
     ) -> str:
         """
         Mirrors Kitsu's desktop notification title strings (English locale).
-        When the author is the bridge's own service account, the name is
-        suppressed and a clean verb-only form is used instead.
 
-        With name:    "{Name} commented", "{Name} mentioned you", etc.
-        Without name: "New comment", "Mentioned you", etc.
+        When the author is the bridge's own service account the name is
+        suppressed and a clean verb-only form is used instead.
         """
-        # Suppress service-account name so it never appears in a notification
         is_service_account = bool(
             self._bridge_person_id and author_id == self._bridge_person_id
         )
@@ -166,8 +247,27 @@ class KitsuClient:
             if is_publish:
                 return f"{name} published a preview" if name else "Preview published"
             return f"{name} commented" if name else "New comment"
-        # Fallback — treat as a comment
         return f"{name} commented" if name else "New comment"
+
+    # ── Deduplication ──────────────────────────────────────────────────────────
+
+    def _is_duplicate(self, person_id: str, task_id: str) -> bool:
+        """
+        Return True if we already sent a push for (person_id, task_id) within
+        DEDUP_WINDOW_SECS.  Kitsu fires both a "mention" and a "comment"
+        notification:new for the same comment — the second must be dropped.
+        """
+        key = (person_id, task_id)
+        now = time.monotonic()
+        last = self._recent_pushes.get(key, 0.0)
+        if now - last < DEDUP_WINDOW_SECS:
+            return True
+        self._recent_pushes[key] = now
+        # Prune stale entries to keep memory bounded
+        if len(self._recent_pushes) > 2000:
+            cutoff = now - DEDUP_WINDOW_SECS
+            self._recent_pushes = {k: v for k, v in self._recent_pushes.items() if v > cutoff}
+        return False
 
     # ── Notification dispatch ──────────────────────────────────────────────────
 
@@ -180,7 +280,6 @@ class KitsuClient:
         body: str,
         data: Dict[str, Any],
     ) -> None:
-        """Send to an already-resolved list of tokens."""
         await self.pusher.send(
             tokens=tokens,
             title=self._APP_NAME,
@@ -211,70 +310,55 @@ class KitsuClient:
         async def on_any(event, data):
             logger.debug("Socket.IO event: %s  data=%s", event, str(data)[:200])
 
-        # PRIMARY: Kitsu already resolves recipients — one event per person.
+        # PRIMARY: notification:new is the only handler that sends pushes.
+        # Kitsu already resolves recipients — one event per person.
         @sio.on("notification:new", namespace=NS)
         async def on_notification_new(data):
             asyncio.create_task(self._handle_notification_new(data))
 
-        # SECONDARY: kept as no-ops.  notification:new covers all cases that
-        # matter. Listening to these as well would cause duplicate pushes.
+        # SECONDARY: no-ops — notification:new covers all of these.
+        # Listening to them as well causes duplicate pushes.
         @sio.on("comment:new",      namespace=NS)
-        async def on_comment_new(data):    pass
+        async def on_comment_new(data):   pass
 
         @sio.on("task:update",      namespace=NS)
-        async def on_task_update(data):    pass
+        async def on_task_update(data):   pass
 
         @sio.on("task:to-review",   namespace=NS)
-        async def on_to_review(data):      pass
+        async def on_to_review(data):     pass
 
         @sio.on("task:assign",      namespace=NS)
-        async def on_assign(data):         pass
+        async def on_assign(data):        pass
 
         @sio.on("preview-file:new", namespace=NS)
-        async def on_preview_new(data):    pass
+        async def on_preview_new(data):   pass
 
     # ── Primary handler ────────────────────────────────────────────────────────
 
     async def _handle_notification_new(self, data: Dict) -> None:
         """
-        Kitsu fires notification:new once per recipient — it has already
-        resolved who should see the notification.
+        Handle a notification:new socket event.
 
-        Socket event payload: { notification_id, person_id }
-        Notification types (Zou): comment, mention, reply, reply-mention,
-                                   assignation, playlist-ready.
-        A "comment" notification is treated as "publish" when the linked
-        comment has a preview file attached.
-
-        Subtitle mirrors Kitsu's desktop notification title strings exactly.
-        Body mirrors Kitsu's buildBody(): project / entity_path / task_type.
-        notification_id is included in the payload so the app can mark it
-        read on tap and navigate directly to the task.
+        Kitsu fires this once per recipient.  The event carries only
+        { notification_id, person_id }.  We fetch the notification record to
+        get the type, author_id, task_id and comment_id, then build the push
+        content from those IDs.
         """
-        person_id       = data.get("person_id")
+        person_id       = data.get("person_id") or ""
         notification_id = data.get("notification_id") or ""
         if not person_id:
             return
 
         tokens = await self.store.get_tokens_for_user(person_id)
         if not tokens:
-            logger.debug("notification:new — no tokens for user %s, skipping", person_id)
+            logger.debug("notification:new — no tokens for %s, skipping", person_id)
             return
-
-        # Defaults used when the notification record cannot be enriched
-        subtitle = "New notification"
-        body     = ""
-        task_id  = ""
 
         if not notification_id:
-            logger.warning("notification:new — missing notification_id in event data; sending bare push")
-            await self._notify(
-                tokens, subtitle, body,
-                {"type": "notification:new", "task_id": "", "project_id": "",
-                 "notification_id": ""},
-            )
+            logger.warning("notification:new — missing notification_id, skipping")
             return
 
+        # ── Fetch notification record ──────────────────────────────────────────
         notif = await self._api_get(f"/data/notifications/{notification_id}")
         if not notif:
             logger.warning("notification:new — could not fetch notification %s", notification_id)
@@ -287,74 +371,73 @@ class KitsuClient:
         playlist_id = notif.get("playlist_id") or ""
 
         logger.debug(
-            "notification:new — id=%s type=%s task_id=%s author_id=%s comment_id=%s",
-            notification_id, ntype, task_id, author_id, comment_id,
+            "notification:new — id=%s type=%s task_id=%s author_id=%s",
+            notification_id, ntype, task_id, author_id,
         )
 
-        # Fetch author and task concurrently
-        async def _noop() -> None:
-            return None
+        # ── Deduplication: drop Kitsu's mention+comment duplicate pair ─────────
+        # When a comment mentions someone, Kitsu fires notification:new twice
+        # for the same person+task (types "mention" and "comment").  The first
+        # to arrive wins; the second is suppressed.
+        dedup_key_id = task_id or notification_id
+        if self._is_duplicate(person_id, dedup_key_id):
+            logger.info(
+                "notification:new — dedup suppressed (person=%s task=%s type=%s)",
+                person_id, task_id, ntype,
+            )
+            return
 
-        person_result, task_result = await asyncio.gather(
-            self._get_person(author_id) if author_id else _noop(),
-            self._get_task(task_id)     if task_id  else _noop(),
-            return_exceptions=True,
+        # ── Fetch author + task info concurrently ──────────────────────────────
+        person_result, task_info = await asyncio.gather(
+            self._get_person(author_id) if author_id else asyncio.sleep(0),
+            self._get_task_info(task_id) if task_id else asyncio.sleep(0),
         )
-        if isinstance(person_result, Exception):
-            logger.warning("Failed to fetch author %s: %s", author_id, person_result)
-            person_result = None
-        if isinstance(task_result, Exception):
-            logger.warning("Failed to fetch task %s: %s", task_id, task_result)
-            task_result = None
 
-        author_name = ""
-        if person_result:
-            author_name = person_result.get("full_name") or person_result.get("name") or ""
+        author_name = (person_result or {}).get("full_name") or (person_result or {}).get("name") or ""
 
-        # Build body breadcrumb from task (project / entity path / task type)
-        if task_result:
-            body = self._build_body(task_result)
+        # ── Build body breadcrumb ──────────────────────────────────────────────
+        body = ""
+        if task_info:
+            body = self._build_body(task_info)
             if not body:
                 logger.warning(
-                    "notification:new — _build_body returned empty for task %s "
-                    "(project_name=%r entity_type_name=%r entity_name=%r "
-                    "sequence_name=%r episode_name=%r task_type_name=%r)",
+                    "notification:new — breadcrumb empty for task %s "
+                    "(project=%r type=%r entity=%r entity_type=%r seq=%r ep=%r)",
                     task_id,
-                    task_result.get("project_name"),
-                    task_result.get("entity_type_name"),
-                    task_result.get("entity_name"),
-                    task_result.get("sequence_name"),
-                    task_result.get("episode_name"),
-                    task_result.get("task_type_name"),
+                    task_info.get("project_name"),
+                    task_info.get("task_type_name"),
+                    task_info.get("entity_name"),
+                    task_info.get("entity_type_name"),
+                    task_info.get("sequence_name"),
+                    task_info.get("episode_name"),
                 )
         else:
             logger.warning(
-                "notification:new — no task result for task_id=%r (notification=%s)",
+                "notification:new — could not resolve task info for task_id=%r (notification=%s)",
                 task_id, notification_id,
             )
 
-        # Detect publish: a comment notification whose comment has a preview file
+        # ── Build subtitle ─────────────────────────────────────────────────────
+        # Detect publish: a comment notification whose linked comment has a
+        # preview file attached.
         is_publish = False
         if ntype == "comment" and comment_id:
             comment = await self._get_comment(comment_id)
             if comment:
-                is_publish = bool(
-                    comment.get("preview_file_id") or comment.get("previews")
-                )
+                is_publish = bool(comment.get("preview_file_id") or comment.get("previews"))
 
-        # playlist-ready is not task-linked — use playlist name as body
         if ntype == "playlist-ready" and playlist_id:
-            playlist = await self._get_playlist(playlist_id)
+            playlist     = await self._get_playlist(playlist_id)
             playlist_name = (playlist or {}).get("name") or "Playlist"
-            subtitle = f"{playlist_name} is ready"
+            subtitle      = f"{playlist_name} is ready"
             if not body:
                 body = (playlist or {}).get("project_name") or ""
         else:
             subtitle = self._build_subtitle(ntype, author_id, author_name, is_publish)
 
         logger.info(
-            "notification:new → user=%s  subtitle=%r  body=%r  task_id=%s",
-            person_id, subtitle, body, task_id,
+            "notification:new → person=%s  type=%s  subtitle=%r  body=%r  task_id=%s",
+            person_id, ntype, subtitle, body, task_id,
         )
 
         await self._notify(
@@ -362,7 +445,7 @@ class KitsuClient:
             {
                 "type":            "notification:new",
                 "task_id":         task_id,
-                "project_id":      (task_result or {}).get("project_id") or "",
+                "project_id":      (task_info or {}).get("project_id") or "",
                 "notification_id": notification_id,
             },
         )
