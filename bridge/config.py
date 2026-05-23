@@ -8,18 +8,22 @@ class Config:
     kitsu_url: str
     kitsu_email: str
     kitsu_password: str
-    # APNs
-    apns_key_path: str
-    apns_key_id: str
-    apns_team_id: str
-    apns_bundle_id: str
-    apns_sandbox: bool
+    # Push relay
+    relay_url: str
+    relay_secret: str
+    apns_sandbox: bool  # passed to the relay so it hits sandbox vs production APNs
     # Bridge API
     bridge_host: str
     bridge_port: int
     # Storage
     db_path: str
     log_level: str
+
+    # ── Relay defaults ─────────────────────────────────────────────────────────
+    # RELAY_URL is the same for every studio installation.  Set it to the
+    # deployed URL shown in your Replit dashboard after publishing the API Server.
+    # Example: https://kitsu-mobile-review.YourHandle.replit.app/api/notify
+    _RELAY_URL_DEFAULT = "https://CHANGEME.replit.app/api/notify"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -33,11 +37,9 @@ class Config:
             kitsu_url=require("KITSU_URL").rstrip("/"),
             kitsu_email=require("KITSU_EMAIL"),
             kitsu_password=require("KITSU_PASSWORD"),
-            apns_key_path=require("APNS_KEY_PATH"),
-            apns_key_id=require("APNS_KEY_ID"),
-            apns_team_id=require("APNS_TEAM_ID"),
-            apns_bundle_id=require("APNS_BUNDLE_ID"),
-            apns_sandbox=os.environ.get("APNS_SANDBOX", "false").strip().lower() == "true",
+            relay_url=os.environ.get("RELAY_URL", cls._RELAY_URL_DEFAULT).strip(),
+            relay_secret=require("RELAY_SECRET"),
+            apns_sandbox=os.environ.get("APNS_SANDBOX", "true").strip().lower() == "true",
             bridge_host=os.environ.get("BRIDGE_HOST", "127.0.0.1"),
             bridge_port=int(os.environ.get("BRIDGE_PORT", "9090")),
             db_path=os.environ.get("DB_PATH", "./bridge_tokens.db"),

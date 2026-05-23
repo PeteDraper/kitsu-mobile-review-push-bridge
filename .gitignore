@@ -1,5 +1,5 @@
 .env
-*.p8
 bridge_tokens.db
 __pycache__/
 *.pyc
+*.p8

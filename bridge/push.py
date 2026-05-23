@@ -1,33 +1,18 @@
 import logging
-import uuid
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
-from aioapns import APNs, NotificationRequest
-from aioapns.common import APNS_RESPONSE_CODE
+import aiohttp
 
 from .config import Config
 
 logger = logging.getLogger(__name__)
 
-# APNs HTTP status codes that mean the token is permanently invalid — remove from DB
-# GONE (410)       → Unregistered: device reset or app uninstalled
-# BAD_REQUEST (400) → BadDeviceToken: malformed / wrong-environment token
-_DEAD_TOKEN_ERRORS = {
-    APNS_RESPONSE_CODE.GONE,
-    APNS_RESPONSE_CODE.BAD_REQUEST,
-}
-
 
 class PushSender:
     def __init__(self, config: Config):
-        self._apns = APNs(
-            key=open(config.apns_key_path).read(),
-            key_id=config.apns_key_id,
-            team_id=config.apns_team_id,
-            topic=config.apns_bundle_id,
-            use_sandbox=config.apns_sandbox,
-        )
-        # Optional callback set by main.py so dead tokens can be purged
+        self._relay_url    = config.relay_url
+        self._relay_secret = config.relay_secret
+        self._sandbox      = config.apns_sandbox
         self.on_dead_token: Optional[Callable[[str], Coroutine]] = None
 
     async def send(
@@ -41,9 +26,8 @@ class PushSender:
     ) -> None:
         if not tokens:
             return
-
         for token in tokens:
-            await self._send_one(token, title, body, subtitle, data or {}, sound)
+            await self._send_one(token, title, body, subtitle, data or {})
 
     async def _send_one(
         self,
@@ -52,42 +36,61 @@ class PushSender:
         body: str,
         subtitle: str,
         data: Dict[str, Any],
-        sound: str,
     ) -> None:
-        alert: Dict[str, Any] = {"title": title, "body": body}
-        if subtitle:
-            alert["subtitle"] = subtitle
-        # expo-notifications reads request.content.data from userInfo["body"].
-        # Putting custom keys at the top level (payload.update(data)) leaves
-        # data=null on the JS side.  Wrapping under "body" is how Expo's own
-        # push service encodes custom payloads and is what the native SDK
-        # looks for first in its serialisation path.
         payload: Dict[str, Any] = {
-            "aps": {
-                "alert": alert,
-                "sound": sound,
-            },
-            "body": data,
+            "device_token": device_token,
+            "title":        title,
+            "body":         body,
+            "data":         data,
+            "sandbox":      self._sandbox,
+        }
+        if subtitle:
+            payload["subtitle"] = subtitle
+
+        headers = {
+            "Content-Type":   "application/json",
+            "X-Relay-Secret": self._relay_secret,
         }
 
-        request = NotificationRequest(
-            device_token=device_token,
-            message=payload,
-            notification_id=str(uuid.uuid4()),
-        )
-
         try:
-            result = await self._apns.send_notification(request)
-            if result.is_successful:
-                logger.debug("APNs delivery OK for token …%s", device_token[-8:])
-            else:
-                logger.warning(
-                    "APNs error for token …%s: %s",
-                    device_token[-8:],
-                    result.description,
-                )
-                if result.status in _DEAD_TOKEN_ERRORS and self.on_dead_token:
-                    logger.info("Removing dead token …%s", device_token[-8:])
-                    await self.on_dead_token(device_token)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self._relay_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as resp:
+                    if resp.status == 200:
+                        logger.debug("Relay delivery OK for token …%s", device_token[-8:])
+                    elif resp.status == 502:
+                        # Relay forwarded request but APNs rejected it — log detail
+                        text = await resp.text()
+                        logger.warning(
+                            "APNs rejected token …%s: %s",
+                            device_token[-8:],
+                            text[:300],
+                        )
+                        # Surface dead tokens: relay returns APNs status in JSON
+                        try:
+                            import json
+                            detail = json.loads(text)
+                            apns_status = detail.get("apnsStatus")
+                            apns_reason = detail.get("detail", "")
+                            if apns_status in (410, 400) and "DeviceToken" in apns_reason:
+                                logger.info("Dead token …%s — removing", device_token[-8:])
+                                if self.on_dead_token:
+                                    await self.on_dead_token(device_token)
+                        except Exception:
+                            pass
+                    elif resp.status == 401:
+                        logger.error("Relay rejected request: invalid RELAY_SECRET")
+                    else:
+                        text = await resp.text()
+                        logger.warning(
+                            "Relay HTTP %s for token …%s: %s",
+                            resp.status,
+                            device_token[-8:],
+                            text[:200],
+                        )
         except Exception as e:
-            logger.error("APNs send exception for token …%s: %s", device_token[-8:], e)
+            logger.error("Relay send exception for token …%s: %s", device_token[-8:], e)
