@@ -1,0 +1,5 @@
+.env
+bridge_tokens.db
+__pycache__/
+*.pyc
+*.p8
